@@ -173,12 +173,23 @@ For Mixture-of-Experts models, MLX's `SwitchLinear` module requires all experts 
 
 Models quantized with MINT are available on HuggingFace under [baa-ai](https://huggingface.co/baa-ai):
 
+### GGUF (cross-platform: llama.cpp, ollama, LM Studio)
+
 | Model | Size | HuggingFace |
 |-------|------|-------------|
-| Qwen3-30B-A3B | 15.5 GB | Coming soon |
-| Mixtral-8x7B | 24.5 GB | Coming soon |
-| Llama-4-Scout | 58 GB | [baa-ai/Llama-4-Scout-17B-16E-Instruct-SWAN-4bit](https://huggingface.co/baa-ai/Llama-4-Scout-17B-16E-Instruct-SWAN-4bit) |
-| MiniMax-M2.5 | 118 GB | [baa-ai/MiniMax-M2.5-SWAN-4bit](https://huggingface.co/baa-ai/MiniMax-M2.5-SWAN-4bit) |
+| Mixtral-8x7B-Instruct | 26 GB | [baa-ai/Mixtral-8x7B-Instruct-SWAN-4bit-GGUF](https://huggingface.co/baa-ai/Mixtral-8x7B-Instruct-SWAN-4bit-GGUF) |
+| Qwen3-30B-A3B | 16 GB | [baa-ai/Qwen3-30B-A3B-SWAN-4bit-GGUF](https://huggingface.co/baa-ai/Qwen3-30B-A3B-SWAN-4bit-GGUF) |
+
+### MLX (Apple Silicon)
+
+| Model | Size | HuggingFace |
+|-------|------|-------------|
+| Llama-4-Scout | 58 GB | [baa-ai/Llama-4-Scout-17B-16E-Instruct-SWAN-4bit-MLX](https://huggingface.co/baa-ai/Llama-4-Scout-17B-16E-Instruct-SWAN-4bit-MLX) |
+| Llama-4-Maverick | 172 GB | [baa-ai/Llama-4-Maverick-17B-128E-Instruct-SWAN-4bit-MLX](https://huggingface.co/baa-ai/Llama-4-Maverick-17B-128E-Instruct-SWAN-4bit-MLX) |
+| MiniMax-M2.5 | 118 GB | [baa-ai/MiniMax-M2.5-SWAN-4bit-MLX](https://huggingface.co/baa-ai/MiniMax-M2.5-SWAN-4bit-MLX) |
+| GLM-4.7-Flash | 16 GB | [baa-ai/GLM-4.7-Flash-SWAN-4bit-MLX](https://huggingface.co/baa-ai/GLM-4.7-Flash-SWAN-4bit-MLX) |
+| Llama-3.1-70B | 47 GB | [baa-ai/Llama-3.1-70B-Instruct-SWAN-5bit-MLX](https://huggingface.co/baa-ai/Llama-3.1-70B-Instruct-SWAN-5bit-MLX) |
+| Llama-3.3-70B | 47 GB | [baa-ai/Llama-3.3-70B-Instruct-SWAN-5bit-MLX](https://huggingface.co/baa-ai/Llama-3.3-70B-Instruct-SWAN-5bit-MLX) |
 
 ## File Inventory
 
