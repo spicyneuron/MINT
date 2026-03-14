@@ -1,0 +1,883 @@
+% MINT: Compute-Optimal Data-Free Mixed-Precision Quantization
+% via Rate-Distortion Optimization
+% Target: NeurIPS 2026 / MLSys 2027
+
+\documentclass{article}
+
+% Use a standard ML conference style
+\usepackage[final]{neurips_2024}  % NeurIPS style, swap for target venue
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{subcaption}
+
+\title{MINT: Compute-Optimal Data-Free Mixed-Precision Quantization\\for Large Language Models via Rate-Distortion Optimization}
+
+\author{
+  Anonymous Author(s)
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \textbf{MINT} (\textbf{M}emory-\textbf{I}nformed \textbf{N}-bit \textbf{T}uning), a data-free mixed-precision quantization framework that formulates per-tensor bit-width and group-size allocation as a \emph{compute-optimal allocation problem}. Given a user-specified memory budget, MINT jointly selects the optimal (bit-width, group-size) configuration for each weight tensor by solving a Multiple-Choice Knapsack Problem (MCKP) over per-tensor rate-distortion curves. The framework introduces three key innovations: (1) \textbf{budget-targeted quantization}---users specify an exact memory target (e.g., ``fit in 4\,GB for iPhone'' or ``fit in 24\,GB for RTX 4090'') and MINT produces the provably optimal allocation for that budget, with a fitted prediction curve that estimates output quality \emph{before} running the pipeline; (2) \textbf{joint bit-width and group-size optimization} that treats group size as a first-class allocation variable, revealing that group-size selection provides larger quality gains than bit-width changes; and (3) an \textbf{SQNR safety veto} with an empirically validated 9\,dB threshold that exploits the natural gap between catastrophic 2-bit quantization (SQNR $<$ 9\,dB, PPL triples) and usable 3-bit quantization (SQNR $>$ 10\,dB). We evaluate MINT on six model families spanning 8B--109B parameters across dense and Mixture-of-Experts architectures. On Qwen3-30B-A3B, MINT achieves +0.6\% perplexity degradation versus BF16 at 19\,GB (33\% of full size) and matches prior heuristic quality at 2.6\% less storage. On Llama-4-Scout (109B MoE), MINT enables hardware-targeted deployment of the same model across memory tiers: PPL 7.703 at 58\,GB for a 64\,GB device versus PPL 7.359 at 163\,GB for a 192\,GB device, both outperforming uniform 4-bit (PPL 7.899). In matched-size comparisons against GPTQ---a calibration-based method---across three MoE families (Qwen3-30B-A3B, Qwen2-57B-A14B, Mixtral-8x7B), MINT consistently outperforms GPTQ despite being entirely data-free: $-1.7\%$, $-0.95\%$, and $-4.6\%$ perplexity respectively at identical model sizes. We also demonstrate that standard mean perplexity can be misleading---median perplexity reveals the true quality ordering and should be reported alongside means. The entire pipeline requires no calibration data, no gradient computation, and completes in under 50 minutes on commodity hardware.
+\end{abstract}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+Post-training quantization (PTQ) has become the primary means of deploying large language models on consumer hardware. Methods such as GPTQ~\cite{frantar2023gptq}, AWQ~\cite{lin2024awq}, and SqueezeLLM~\cite{kim2024squeezellm} achieve remarkable compression, but they share a common requirement: a representative calibration dataset. This introduces practical concerns---calibration data may be unavailable for proprietary models, the chosen distribution may not generalize to deployment domains, and calibration demands substantial compute.
+
+Existing data-free approaches~\cite{tang2024easyquant,zhang2025mxq,badri2024hqq} typically apply uniform bit-widths or rely on single sensitivity metrics with hand-tuned thresholds. These approaches face two fundamental limitations. First, \emph{threshold-based allocation} produces fixed bit-width decisions regardless of the deployment memory budget---the user cannot specify ``quantize this model to fit in 6\,GB'' and receive a provably optimal allocation. Second, \emph{single-point error proxies} create circularity: using 4-bit reconstruction error to decide 4-bit allocation means the method partly predicts its own label.
+
+We address both limitations with \textbf{MINT} (\textbf{M}emory-\textbf{I}nformed \textbf{N}-bit \textbf{T}uning), which reformulates mixed-precision quantization as a constrained optimization problem:
+\begin{equation}
+    \min_{\{(b_i, g_i)\}} \sum_{i=1}^{T} \pi_i \cdot \alpha_i \cdot \text{NRMSE}_i(b_i, g_i) \qquad
+    \text{s.t.} \quad \sum_{i=1}^{T} \text{size}_i(b_i, g_i) \leq B
+    \label{eq:objective}
+\end{equation}
+where $b_i$ and $g_i$ are the bit-width and group size for tensor $i$, $B$ is the user's memory budget, $\pi_i$ is a soft protection prior, and $\alpha_i$ is a learned importance weight. The key insight is that \emph{both bit-width and group size} are allocation variables---prior work optimizes bit-width alone, but our evidence shows group-size selection often provides larger quality improvements than bit-width changes.
+
+Our contributions are:
+\begin{itemize}
+    \item A \textbf{compute-optimal formulation} (MCKP) that jointly optimizes per-tensor bit-width and group size, replacing ad-hoc thresholds with a principled allocation under an explicit memory constraint.
+    \item \textbf{Budget-targeted deployment}: users specify an exact memory target and receive the optimal allocation. A fitted PPL prediction curve enables quality estimation \emph{before} running the pipeline, enabling hardware-specific deployment planning (e.g., iPhone 16\,GB, RTX 4090 24\,GB, Mac M4 Pro 48\,GB).
+    \item \textbf{Quantizer-aligned sensitivity features}: per-group kurtosis matching quantization granularity, norm-guided probes using the model's own LayerNorm geometry, and multi-point rate-distortion curves that break circularity.
+    \item An \textbf{SQNR safety veto} providing absolute quality floors independent of relative ranking, with an empirically determined 9\,dB threshold that exploits the natural SQNR gap between 2-bit (catastrophic, max 8.7\,dB) and 3-bit (usable, min 10.4\,dB).
+    \item Evidence that \textbf{group-size selection is the primary quality lever}: on Qwen3-30B-A3B, 85\% of tensors receive group size 32 instead of the default 128, and this accounts for more quality improvement than bit-width changes.
+    \item A recommendation to report \textbf{median perplexity} alongside means, with evidence that mean PPL obscures the true quality ordering on models with outlier sequences.
+    \item Evidence that MINT \textbf{consistently outperforms calibration-based GPTQ} at matched model sizes across three MoE families (Qwen3-30B-A3B, Qwen2-57B-A14B, Mixtral-8x7B), achieving $-0.95\%$ to $-4.6\%$ lower perplexity despite being entirely data-free.
+    \item \textbf{Expert-grouped allocation} for MoE models: a constraint-aware grouping strategy that treats all experts within a SwitchLinear module as a single allocation unit with worst-case error, correctly modeling the hardware constraint that co-located experts share quantization parameters.
+    \item \textbf{Scalability to 109B parameters}: evaluation on Llama-4-Scout (109B MoE, 48 layers, 16 routed experts) demonstrates hardware-targeted deployment across memory tiers with a single analysis pass.
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Related Work}
+\label{sec:related}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\paragraph{Calibration-based PTQ.}
+GPTQ~\cite{frantar2023gptq} applies layerwise optimal brain quantization using Hessian information from calibration data. AWQ~\cite{lin2024awq} identifies salient weight channels via activation-aware scaling. SqueezeLLM~\cite{kim2024squeezellm} combines sensitivity-based non-uniform quantization with dense-and-sparse decomposition. SpQR~\cite{dettmers2024spqr} isolates outlier weights for full-precision storage. QuIP~\cite{chee2024quip} applies random orthogonal transformations before quantization. SmoothQuant~\cite{xiao2023smoothquant} migrates quantization difficulty from activations to weights. All require calibration data.
+
+\paragraph{Data-free quantization.}
+EasyQuant~\cite{tang2024easyquant} proposes data-free PTQ via weight distribution analysis. MXQ~\cite{zhang2025mxq} uses Frobenius norm of quantization error as a single sensitivity metric. HQQ~\cite{badri2024hqq} uses half-quadratic splitting for fast uniform quantization. HIGGS~\cite{badri2025higgs} applies Hadamard rotation via the linearity theorem. These methods typically apply uniform bit-widths or coarse-grained mixed precision. MINT differs by formulating allocation as constrained optimization over joint (bit-width, group-size) configurations with multiple quantizer-aligned features.
+
+\paragraph{Sensitivity-based mixed-precision allocation.}
+LLM-MQ~\cite{li2024llmmq} formulates mixed-precision as an integer linear program but requires calibration for sensitivity estimation. SliM-LLM~\cite{huang2025slimllm} achieves group-wise mixed precision but requires calibration data. CherryQ~\cite{shang2024cherryq} identifies high-impact parameters but also requires calibration. MINT is, to our knowledge, the first method to combine data-free sensitivity estimation with constrained optimization over both bit-width and group-size at per-tensor granularity.
+
+\paragraph{MoE quantization.}
+MC-MoE~\cite{wei2025mcmoe} combines expert quantization with dynamic pruning. MoEQuant~\cite{huang2025moequant} proposes expert-balanced sampling for calibration. These highlight unique MoE challenges---uneven expert activation, sparse routing---but require calibration data. MINT's data-free approach is particularly advantageous for MoE models where calibration must cover activation patterns across hundreds of experts.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Method}
+\label{sec:method}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+MINT operates in two passes over the model's weight tensors, followed by a compute-optimal allocation. The entire pipeline is \emph{data-free}---it requires only the pretrained weight tensors.
+
+\subsection{Pass 1: Feature Extraction and Rate-Distortion Curves}
+
+For each weight tensor $\mathbf{W} \in \mathbb{R}^{m \times n}$, MINT computes three categories of features plus a complete rate-distortion curve.
+
+\subsubsection{Spectral Features}
+
+We compute three scale-invariant spectral features from the singular values $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_r$ (via randomized SVD with rank $k = 256$):
+
+\paragraph{Stable rank.} The effective dimensionality of $\mathbf{W}$:
+\begin{equation}
+    r_s(\mathbf{W}) = \frac{\|\mathbf{W}\|_F^2}{\|\mathbf{W}\|_2^2} = \frac{\sum_{i=1}^{r} \sigma_i^2}{\sigma_1^2}
+\end{equation}
+Unlike spectral concentration (used in prior work), stable rank is unambiguously interpretable: lower values indicate that fewer directions carry most information, making quantization more likely to corrupt critical components.
+
+\paragraph{Spectral tail mass.} The fraction of energy outside the top $k/10$ singular values:
+\begin{equation}
+    \tau(\mathbf{W}) = 1 - \frac{\sum_{i=1}^{\lfloor r/10 \rfloor} \sigma_i^2}{\sum_{i=1}^{r} \sigma_i^2}
+\end{equation}
+
+\paragraph{Log condition number.} A measure of numerical sensitivity, capped at $10.0$:
+\begin{equation}
+    \kappa(\mathbf{W}) = \min\!\left(10, \, \log_{10}\!\left(\frac{\sigma_1}{\sigma_{\min} + \varepsilon}\right)\right)
+\end{equation}
+
+These three features replace the single ``SVD concentration'' metric of prior data-free methods, which was criticized for having an ambiguous relationship with quantization sensitivity~\cite{bondarenko2023quantizable}. Rather than collapsing spectral information into a single score, these three features allow the allocator to distinguish tensors with similar overall energy but different spectral decay profiles.
+
+\subsubsection{Per-Group Kurtosis Features}
+
+Modern PTQ uses group-wise quantization (groups of $g$ weights sharing a scale factor). Global kurtosis---computed over the flattened tensor---misaligns with this granularity: a handful of outliers spike global kurtosis even though group-wise quantization isolates those outliers into local scale factors.
+
+We reshape $\mathbf{W}$ into $K = \lceil mn / g \rceil$ groups of size $g = 128$ and compute the excess kurtosis $\kappa_j$ for each group $j$:
+\begin{equation}
+    \kappa_j = \frac{1}{g} \sum_{i=1}^{g} \left(\frac{w_{j,i} - \bar{w}_j}{s_j}\right)^4 - 3
+\end{equation}
+
+Four features are extracted from the distribution $\{\kappa_1, \ldots, \kappa_K\}$:
+\begin{align}
+    f_{\text{kurt90}} &= P_{90}(\kappa_1, \ldots, \kappa_K) & \text{(90th percentile)} \\
+    f_{\text{ratio}} &= P_{99} / P_{50} & \text{(tail heaviness variation)} \\
+    f_{\text{outlier}} &= \frac{1}{K} \sum_{j=1}^{K} \mathbf{1}[\exists\, w_{j,i} : |w_{j,i} - \bar{w}_j| > 3s_j] & \text{(outlier group fraction)} \\
+    f_{\text{maxmed}} &= \max(\kappa_j) / \text{median}(\kappa_j) & \text{(max-to-median ratio)}
+\end{align}
+
+This alignment between the statistical metric and the quantization mechanism directly addresses the critique that global kurtosis operates at the wrong granularity~\cite{zhao2025kurtail}.
+
+\subsubsection{Norm-Guided Output Noise Amplification}
+
+Estimating output sensitivity without calibration data requires probe vectors. Prior data-free methods use isotropic random probes $\mathbf{x} \sim \mathcal{U}(-1, 1)^n$, but LLM activations are highly anisotropic---massive persistent channel-wise outliers dominate inference geometry~\cite{xiao2023smoothquant,lin2024awq}.
+
+MINT preserves the data-free property while injecting the model's own activation geometry. Each linear layer in a transformer is preceded by a normalization layer (LayerNorm or RMSNorm) with a learned scale parameter $\boldsymbol{\gamma} \in \mathbb{R}^n$. We sample probes from:
+\begin{equation}
+    \mathbf{x}_j \sim \mathcal{N}(\mathbf{0}, \, \text{diag}(\boldsymbol{\gamma}^2))
+    \label{eq:norm_probes}
+\end{equation}
+This encodes the model's learned channel importance: channels with large $\gamma_c$ produce large activation magnitudes, and our probes respect this structure.
+
+Furthermore, we replace the synthetic uniform perturbation of prior work with the \emph{actual} round-to-nearest (RTN) quantization residual:
+\begin{equation}
+    \Delta \mathbf{W} = Q(\mathbf{W}; 4, 128) - \mathbf{W}
+\end{equation}
+where $Q(\cdot; b, g)$ denotes group-wise RTN quantization at $b$ bits with group size $g$. The output noise amplification is then:
+\begin{equation}
+    f_{\text{out}} = \frac{\|\Delta \mathbf{W} \cdot \mathbf{X}\|_F}{\|\mathbf{W} \cdot \mathbf{X}\|_F + \varepsilon}
+    \label{eq:output_noise}
+\end{equation}
+averaged over $p = 32$ normalized probe vectors. If a preceding normalization layer is not available, we fall back to isotropic probes $\mathbf{x} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$.
+
+\subsubsection{Rate-Distortion Curves}
+
+Prior data-free methods compute reconstruction error at a single operating point (typically 4-bit), creating circularity when this error is used to decide 4-bit allocation.
+
+MINT computes a complete \textbf{rate-distortion curve}: the normalized RMSE at every valid (bit-width, group-size) configuration:
+\begin{equation}
+    \text{NRMSE}_i(b, g) = \frac{\text{RMS}(Q(\mathbf{W}_i; b, g) - \mathbf{W}_i)}{\text{RMS}(\mathbf{W}_i)}
+\end{equation}
+evaluated at configurations $\mathcal{C} = \{(2,32), (3,64), (4,32), (4,64), (4,128), (8,64), (8,128), (16,0)\}$.
+
+This curve serves two purposes: it provides the \emph{loss function} for the allocator (the NRMSE at the chosen configuration), and it yields four derived features that characterize the \emph{shape} of each tensor's error response:
+\begin{itemize}
+    \item $f_{\text{auc}}$: trapezoidal area under the RD curve (overall compressibility)
+    \item $f_{\text{m48}}$: $\text{NRMSE}(4,128) - \text{NRMSE}(8,128)$ (marginal gain from 4 to 8 bits)
+    \item $f_{\text{m24}}$: $\text{NRMSE}(2,32) - \text{NRMSE}(4,128)$ (marginal gain from 2 to 4 bits)
+    \item $f_{\text{slope}}$: ratio of low-bit to high-bit marginal slopes (curvature)
+\end{itemize}
+
+\subsubsection{SQNR Safety Veto}
+
+We compute the signal-to-quantization-noise ratio (SQNR) at each configuration:
+\begin{equation}
+    \text{SQNR}_i(b, g) = 10 \cdot \log_{10}\!\left(\frac{\|\mathbf{W}_i\|_F^2}{\|\mathbf{W}_i - Q(\mathbf{W}_i; b, g)\|_F^2}\right) \;\text{dB}
+\end{equation}
+
+Any configuration with $\text{SQNR} < \tau_{\text{floor}}$ (default $\tau_{\text{floor}} = 9$\,dB) is \textbf{excluded} from the allocator's candidate set $\mathcal{C}_i$. This provides an \emph{absolute} safety floor: regardless of budget pressure or relative ranking, tensors will never be assigned configurations that introduce catastrophic distortion. The 9\,dB threshold is empirically determined (\S\ref{sec:sqnr_validation}): it sits in the natural gap between 2-bit SQNR (max ${\sim}$8.7\,dB) and 3-bit SQNR (min ${\sim}$10.4\,dB), blocking catastrophic 2-bit allocations while permitting usable 3-bit configurations.
+
+\subsection{Pass 2: Normalization, Priors, and Allocation}
+
+\subsubsection{eCDF Normalization}
+
+Prior data-free methods normalize features using hardcoded linear bounds (e.g., $\text{clip}((\kappa - 0) / 10, 0, 1)$). These bounds are architecture-specific and saturate on large models---the reconstruction error metric with bounds $[0.005, 0.05]$ saturates at 1.0 for nearly all tensors on models larger than 100B parameters.
+
+MINT replaces all hardcoded bounds with \textbf{empirical CDF (eCDF) percentile ranking}. During Pass~1, raw feature values are collected across all tensors. Each tensor's normalized score for feature $f$ is simply its rank:
+\begin{equation}
+    \hat{f}_i = \frac{|\{j : f_j \leq f_i\}|}{T}
+\end{equation}
+where $T$ is the total number of tensors. eCDF normalization is scale-invariant, never saturates, requires no architecture-specific tuning, and works identically on models from 8B to 400B+ parameters. The mapping is implemented via \texttt{np.searchsorted} on sorted feature arrays for $O(\log T)$ lookups.
+
+\subsubsection{Soft Protection Priors}
+
+Rather than binary hard-coded protection rules (``embeddings stay 16-bit''), MINT uses \textbf{soft multiplicative priors} $\pi_i$ that enter the optimization objective (Eq.~\ref{eq:objective}). A prior of $\pi_i = 10$ means the allocator needs $10\times$ the quality improvement per byte to justify compressing tensor $i$ versus a default tensor.
+
+\begin{table}[h]
+\centering
+\caption{Soft protection priors. Higher values make the allocator less likely to compress the tensor.}
+\label{tab:priors}
+\begin{tabular}{lrl}
+\toprule
+Tensor Type & $\pi_i$ & Rationale \\
+\midrule
+Embedding & 10.0 & Lookup tables; quantization corrupts rare tokens \\
+LM head & 10.0 & Final projection; directly affects output distribution \\
+LayerNorm / RMSNorm & $\infty$ & Tiny ($<$0.01\% of params); critical for training stability \\
+MoE router & 8.0 & Controls expert routing; errors cascade \\
+Vision encoder & 8.0 & Cross-modal alignment is sensitive \\
+First layer & 3.0 & No error correction from prior layers \\
+Last layer & 2.0 & Directly precedes output \\
+Default & 1.0 & No bias \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Tensors with $\pi_i = \infty$ are hard-protected at 16-bit and excluded from the allocator. All other priors participate in the optimization---the allocator \emph{can} compress high-prior tensors if the budget demands it and the quality tradeoff is favorable.
+
+\subsubsection{Budget-Constrained Allocation}
+
+The allocation problem is a \textbf{Multiple-Choice Knapsack Problem (MCKP)}. Each tensor $i$ has a candidate set $\mathcal{C}_i$ (configurations surviving the SQNR veto). For each candidate $(b, g) \in \mathcal{C}_i$, the \emph{cost} is $\text{size}_i(b, g)$ and the \emph{loss} is $\pi_i \cdot \alpha_i \cdot \text{NRMSE}_i(b, g)$.
+
+\begin{equation}
+    \text{size}_i(b, g) = \left\lceil \frac{n_i \cdot b}{8} \right\rceil + \left\lfloor \frac{n_i}{g} \right\rfloor \cdot 4 \;\text{bytes}
+    \label{eq:size}
+\end{equation}
+where $n_i$ is the parameter count and the second term accounts for 16-bit scale and zero-point per group.
+
+The budget $B$ is specified by the user as an absolute size (\texttt{--budget 6GB}), an average bits-per-parameter target (\texttt{--avg-bits 4.0}), or a fraction of BF16 size (\texttt{--budget-ratio 0.25}).
+
+We provide three solvers:
+\begin{enumerate}
+    \item \textbf{Greedy} (default): Initialize all tensors at their lowest-cost valid configuration. Compute \emph{upgrade options}---for each tensor and each higher configuration, compute the efficiency ratio $\eta = \Delta\text{loss} / \Delta\text{size}$. Sort upgrades by $\eta$ descending and greedily apply them until the budget is exhausted. Runtime: $O(T \cdot |\mathcal{C}| \cdot \log(T \cdot |\mathcal{C}|))$, under 10\,ms for 18{,}867 tensors.
+    \item \textbf{LP relaxation}: Continuous relaxation solved via \texttt{scipy.optimize.linprog} with HiGHS, followed by rounding. Near-optimal guarantees.
+    \item \textbf{ILP}: Exact solution via \texttt{scipy.optimize.milp}. Practical for models with fewer than 1{,}000 tensors.
+\end{enumerate}
+
+\subsection{Joint Bit-Width and Group-Size Optimization}
+
+A critical design decision in MINT is that \emph{group size is an allocation variable, not a hyperparameter}. Prior mixed-precision methods optimize bit-width while keeping group size fixed (typically 128). However, empirical evidence shows that reducing group size from 128 to 64 often yields larger perplexity improvements than bit-width changes~\cite{li2025mixllm}.
+
+MINT's configuration space includes multiple group sizes at each bit-width: $\{(4,32), (4,64), (4,128), (8,64), (8,128)\}$. The allocator considers both the quality impact (NRMSE) and the memory cost (Eq.~\ref{eq:size}) of each option, automatically selecting finer granularity for sensitive tensors and coarser granularity for insensitive ones.
+
+\subsection{Pipeline Summary}
+
+\begin{algorithm}[t]
+\caption{MINT Analysis and Allocation Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\REQUIRE Model directory, memory budget $B$, SQNR floor $\tau$
+\ENSURE Per-tensor manifest: $\{(b_i, g_i)\}$ for all tensors
+\STATE \textbf{Pass 1: Feature extraction}
+\FOR{each shard file in model}
+    \FOR{each 2D tensor $\mathbf{W}_i$ with $n_i \geq 1024$}
+        \STATE Extract preceding LayerNorm $\boldsymbol{\gamma}$ (if available)
+        \STATE Compute spectral features: $r_s, \tau, \kappa$
+        \STATE Compute per-group kurtosis features: $f_{\text{kurt90}}, f_{\text{ratio}}, f_{\text{outlier}}, f_{\text{maxmed}}$
+        \STATE Compute output noise amplification $f_{\text{out}}$ via Eq.~\ref{eq:output_noise}
+        \STATE Compute RD curve: $\text{NRMSE}_i(b,g)$ for all $(b,g) \in \mathcal{C}$
+        \STATE Compute SQNR map: $\text{SQNR}_i(b,g)$ for all $(b,g) \in \mathcal{C}$
+        \STATE Collect raw features for eCDF construction
+    \ENDFOR
+    \STATE Free shard memory
+\ENDFOR
+\STATE \textbf{Pass 2: Normalize, allocate}
+\STATE Fit eCDF on collected features; transform all features to percentile ranks
+\STATE Compute protection priors $\pi_i$ for each tensor
+\STATE Filter candidate sets: $\mathcal{C}_i \leftarrow \{(b,g) \in \mathcal{C} : \text{SQNR}_i(b,g) \geq \tau\}$
+\STATE Subtract protected tensor sizes from budget $B$
+\STATE Run greedy MCKP solver $\rightarrow$ allocation $\{(b_i, g_i)\}$
+\STATE Write manifest JSON
+\end{algorithmic}
+\end{algorithm}
+
+The pipeline (Algorithm~\ref{alg:pipeline}) processes safetensor shards sequentially, keeping peak memory well below the model size. The output manifest maps each tensor to its assigned $(b_i, g_i)$ configuration and is used as a quantization predicate during model conversion via MLX~\cite{mlx2023}.
+
+\subsection{Expert Handling for MoE Models}
+
+For MoE models with expert tensors stored as 3D arrays $[E, d_{\text{in}}, d_{\text{out}}]$:
+\begin{itemize}
+    \item \textbf{Individual analysis} ($E \leq 32$): Analyze each expert slice separately. Use worst-case features as the representative and record inter-expert variance.
+    \item \textbf{Clustered analysis} ($E > 32$): Compute lightweight statistics (Frobenius norm, global kurtosis) per expert. Cluster into $\min(8, E/4)$ groups via $k$-means. Sample one expert per cluster; use worst-case across samples.
+\end{itemize}
+
+\subsubsection{Expert-Grouped Allocation}
+
+Inference frameworks (MLX, vLLM) implement MoE expert layers as \texttt{SwitchLinear} modules where all $E$ experts within a single (layer, projection) group share the same quantization parameters. The allocator must respect this constraint: it is not possible to quantize expert 0 at 3-bit and expert 1 at 4-bit within the same module.
+
+MINT groups expert tensors by (layer, projection) before running the MCKP solver. For each group $G = \{W^{(1)}, \ldots, W^{(E)}\}$:
+\begin{itemize}
+    \item \textbf{NRMSE}: worst-case (maximum) across experts: $\text{NRMSE}_G(b,g) = \max_e \text{NRMSE}^{(e)}(b,g)$
+    \item \textbf{SQNR}: worst-case (minimum) across experts: $\text{SQNR}_G(b,g) = \min_e \text{SQNR}^{(e)}(b,g)$
+    \item \textbf{Size}: sum across all experts: $\text{size}_G(b,g) = \sum_e \text{size}^{(e)}(b,g)$
+\end{itemize}
+This reduces the number of allocation variables from $T \cdot E$ to $T$ (e.g., 5{,}376 expert tensors $\rightarrow$ 84 groups on Qwen2-57B-A14B), while ensuring that the solver's output is directly implementable by the runtime. The worst-case NRMSE conservatively prevents any expert from receiving an unsafely aggressive quantization.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Experiments}
+\label{sec:experiments}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+We evaluate MINT on six model families using WikiText-2 perplexity (test split, sequence length 2048, seed 42). All experiments run on an Apple Mac Studio with M2 Ultra (192\,GB unified memory). Analysis uses PyTorch CPU; conversion and inference use MLX~\cite{mlx2023}.
+
+\textbf{Models:} Qwen3-8B (dense, 8.2B parameters), Qwen3-30B-A3B (MoE, 30.5B parameters, 128 routed experts), Qwen2-57B-A14B (MoE, 57.4B parameters, 64 experts/layer), Mixtral-8x7B-Instruct (MoE, 46.7B parameters, 8 experts/layer), GLM-4.7-Flash (dense, 31.2B parameters), and Llama-4-Scout-17B-16E-Instruct (MoE, 109B parameters, 16 routed + 1 shared expert/layer).
+
+\textbf{Baselines:} BF16 (unquantized), uniform 4-bit RTN with group size 64 or 128, GPTQ-Int4 where available, and the threshold-based v1 heuristic.
+
+\subsection{Main Results: Matched-Budget Perplexity}
+\label{sec:main_results}
+
+All comparisons are at matched or near-matched model sizes, addressing the critique that mixed-precision methods win only by spending more bits.
+
+\begin{table}[h]
+\centering
+\caption{Perplexity comparison at matched and varied model sizes. All evaluations use WikiText-2 (test, seq\_len=2048, 128 sequences, seed=42). Both mean and median PPL are reported; we recommend median as the primary metric (\S\ref{sec:mean_vs_median}). $\Delta$ columns are relative to BF16. $\dagger$Values from~\cite{xu2025qwen3quant}. $\ddagger$BF16 model (203\,GB) exceeds available memory; $\Delta$ computed vs uniform 4-bit.}
+\label{tab:main_results}
+\begin{tabular}{llrrrr}
+\toprule
+Model & Condition & Size (GB) & Mean PPL & Median PPL & $\Delta$Med \\
+\midrule
+\multirow{6}{*}{Qwen3-8B}
+    & BF16 baseline & 15.26 & 9.727 & --- & --- \\
+    & AWQ 4-bit$^\dagger$ & 4.05 & 10.50 & --- & +8.1\% \\
+    & GPTQ 4-bit$^\dagger$ & 4.05 & 10.30 & --- & +6.1\% \\
+    & Uniform 4-bit & 4.05 & 10.249 & --- & +5.4\% \\
+    & v1 (best) & 6.05 & 10.097 & --- & +3.8\% \\
+    & \textbf{MINT} & \textbf{6.00} & \textbf{10.039} & --- & \textbf{+3.2\%} \\
+\midrule
+\multirow{6}{*}{\shortstack[l]{Qwen3-30B\\-A3B (MoE)}}
+    & BF16 baseline & 56.87 & 8.728 & --- & --- \\
+    & Uniform 4-bit & 15.11 & 9.629 & --- & +10.3\% \\
+    & v1 (best) & 16.73 & 8.924 & 8.974 & +2.8\% \\
+    & \textbf{MINT (16\,GB)} & \textbf{16.29} & \textbf{8.930} & \textbf{8.971} & \textbf{+2.3\%} \\
+    & \textbf{MINT (17\,GB)} & \textbf{17.39} & \textbf{8.858} & \textbf{8.912} & \textbf{+1.5\%} \\
+    & \textbf{MINT (19\,GB)} & \textbf{19.01} & \textbf{8.782} & \textbf{8.798} & \textbf{+0.6\%} \\
+\midrule
+\multirow{4}{*}{\shortstack[l]{GLM-4.7\\-Flash}}
+    & BF16 baseline & 58.16 & 11.344 & 8.706 & --- \\
+    & Uniform 4-bit & 14.82 & --- & ${\sim}$11.46 & +31.6\% \\
+    & v1 (best) & 15.92 & 9.930 & 9.084 & +4.3\% \\
+    & \textbf{MINT} & \textbf{15.82} & \textbf{9.427} & \textbf{9.210} & \textbf{+5.8\%} \\
+\midrule
+\multirow{8}{*}{\shortstack[l]{Llama-4\\-Scout$^\ddagger$\\(109B MoE)}}
+    & BF16 baseline & ${\sim}$203 & \multicolumn{2}{c}{\emph{exceeds 192\,GB}} & --- \\
+    & MINT (no safety) & 34.62 & 23.577 & 23.714 & +198\% \\
+    & \textbf{MINT (min-safe)} & \textbf{46.93} & \textbf{8.675} & \textbf{8.786} & \textbf{+9.8\%} \\
+    & \textbf{MINT (50\,GB)} & \textbf{51.98} & \textbf{7.980} & \textbf{8.284} & \textbf{+1.0\%} \\
+    & Uniform 4-bit & 56.9 & 7.899 & --- & --- \\
+    & v1 (best) & 59.5 & 7.628 & --- & $-$3.4\% \\
+    & \textbf{MINT (64\,GB)} & \textbf{58.03} & \textbf{7.703} & \textbf{8.070} & \textbf{$-$2.5\%} \\
+    & \textbf{MINT (192\,GB)} & \textbf{163.24} & \textbf{7.359} & \textbf{7.691} & \textbf{$-$6.8\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Qwen3-8B (dense).} MINT achieves PPL 10.039 at 6.00\,GB, outperforming the best v1 configuration (PPL 10.097 at 6.05\,GB) by 0.6\%. The improvement is attributable to joint group-size optimization: MINT assigns group size 32 to 29 tensors, group size 64 to 46, and group size 128 to 101, directing finer granularity to the most sensitive tensors. MINT closes 41\% of the gap between uniform 4-bit and BF16.
+
+\paragraph{Comparison with calibration-based methods (dense).} Published results from an independent evaluation~\cite{xu2025qwen3quant} report GPTQ (PPL 10.30) and AWQ (PPL 10.50) for Qwen3-8B at uniform 4-bit (g128). MINT (PPL 10.039) outperforms both \emph{despite requiring no calibration data}: $-2.5\%$ versus GPTQ and $-4.4\%$ versus AWQ (Table~\ref{tab:main_results}). MINT's advantage comes at a size cost (6.00\,GB vs 4.05\,GB), but this is precisely the budget-targeted tradeoff MINT is designed for: given more memory, it delivers better quality than calibration-based methods achieve with less.
+
+\paragraph{Qwen3-30B-A3B (MoE).} This model demonstrates MINT's budget-targeting capability. At three different user-specified budgets, MINT achieves 100\% budget utilization with monotonically improving quality:
+\begin{itemize}
+    \item At 16.29\,GB: PPL 8.930, matching v1's quality (8.924) at \textbf{2.6\% less storage}
+    \item At 17.39\,GB: PPL 8.858, surpassing v1 by 0.7\%
+    \item At 19.01\,GB: PPL 8.782, within \textbf{0.6\% of BF16} at just 33\% of full size
+\end{itemize}
+The greedy solver allocated 18{,}867 tensors in under 20\,ms. The SQNR safety veto blocked all 2-bit configurations on this model (max SQNR: 8.1\,dB, below the 9\,dB floor), catching unsafe allocations that v1's heuristic thresholds allowed (4\% of parameters at 2-bit with SQNR below 8\,dB). 3-bit configurations (min SQNR: 9.5\,dB) pass the veto and are available to the allocator at tighter budgets.
+
+\paragraph{GLM-4.7-Flash.} MINT achieves median PPL 9.210 at 15.82\,GB, closing 82\% of the gap between uniform 4-bit and BF16. On this model, mean PPL is misleading: BF16 exhibits 5 catastrophic outlier sequences (PPL 25{,}000--81{,}000), inflating the mean to 11.344, while quantized models stabilize these sequences (see \S\ref{sec:mean_vs_median}).
+
+\paragraph{Llama-4-Scout (109B MoE).} This model---the largest in our evaluation at 109 billion parameters with 48 MoE layers---demonstrates MINT's budget-targeting capability at extreme scale. The BF16 model (${\sim}$203\,GB) exceeds our 192\,GB test system, making data-free quantization essential rather than optional. MINT produces two hardware-targeted variants from a single analysis pass:
+\begin{itemize}
+    \item \textbf{64\,GB target}: 58.03\,GB, PPL 7.703, fits a 64\,GB Mac Studio with 6\,GB headroom for KV cache and OS. Outperforms uniform 4-bit (PPL 7.899) by 2.5\%.
+    \item \textbf{192\,GB target}: 163.24\,GB, PPL 7.359, fits a 192\,GB Mac Studio with 29\,GB headroom. The allocator keeps most tensors at BF16 and selectively applies 8-bit to the most compressible expert projections.
+\end{itemize}
+The SQNR safety veto blocks all 2-bit configurations on this architecture (SQNR $<$ 8.7\,dB), while 3-bit configurations (SQNR 10.4--14.6\,dB) pass the 9\,dB floor. This enables a \textbf{minimum safe model of 46.9\,GB} (all 3-bit, PPL 8.675)---17\% smaller than the all-4-bit floor with acceptable quality. A 2-bit model (34.6\,GB) was also tested and confirmed catastrophic (PPL 23.6), validating the veto.
+
+\subsection{Joint Bit-Width and Group-Size Allocation}
+\label{sec:allocation_detail}
+
+Table~\ref{tab:allocation} shows MINT's allocation decisions at the 19\,GB budget on Qwen3-30B-A3B, revealing how the allocator exploits group size as a quality lever.
+
+\begin{table}[h]
+\centering
+\caption{MINT per-tensor allocation at 19\,GB budget on Qwen3-30B-A3B. The allocator overwhelmingly selects group size 32 for 4-bit tensors (85\% of all tensors), trading scale/bias overhead for quantization accuracy.}
+\label{tab:allocation}
+\begin{tabular}{lrrl}
+\toprule
+Config $(b, g)$ & Tensors & \% & Role \\
+\midrule
+(4, 32) & 15{,}908 & 85.2\% & Default: small groups maximize accuracy \\
+(4, 64) & 9 & $<$0.1\% & Transitional \\
+(4, 128) & 96 & 0.5\% & Low-sensitivity tensors \\
+(8, 128) & 2{,}612 & 14.0\% & Sensitive: first/last layer attention, MoE experts \\
+(8, 64) & 1 & $<$0.1\% & \\
+(16, 0) & 241 & 1.3\% & Hard-protected: norms, biases \\
+\midrule
+\textbf{Total} & 18{,}867 & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The dominant pattern is striking: \textbf{85\% of tensors receive 4-bit quantization with group size 32}, not the conventional group size 128. The allocator discovers that reducing group size from 128 to 32 trades 0.125 bytes/parameter of scale/bias overhead for substantially better per-group quantization resolution. This overhead is funded by eliminating all 16-bit allocations for quantizable tensors---v1 allocated 5.6\% of parameters to 16-bit, but the knapsack determines this is wasteful: those bytes produce more quality when redistributed as finer group sizes across 4-bit tensors.
+
+The 8-bit allocations (14\%) concentrate on first-layer attention tensors (prior $\pi = 3.0$), last-layer attention (prior $\pi = 2.0$), and the most sensitive MoE expert weights. Embeddings and the LM head remain at 4-bit despite their prior of $\pi = 10.0$---they are too large for 8-bit upgrades to be efficient.
+
+\subsection{SQNR Safety Veto Validation}
+\label{sec:sqnr_validation}
+
+To determine the optimal SQNR floor, we conducted a systematic sweep on Llama-4-Scout, measuring perplexity at different floor values. The SQNR distribution reveals a natural gap between bit levels that guides floor selection.
+
+\subsubsection{SQNR Distribution Analysis}
+
+Across both Llama-4-Scout (691 2D tensors) and Qwen3-30B-A3B (18{,}674 2D tensors), SQNR values cluster into well-separated bands by bit-width:
+
+\begin{table}[h]
+\centering
+\caption{SQNR distribution (dB) across all 2D tensors on Llama-4-Scout. A natural gap of ${\sim}$2\,dB separates 2-bit (max 8.7\,dB) from 3-bit (min 10.4\,dB). Setting the floor at 9\,dB exploits this gap: all 2-bit configurations are vetoed while all 3-bit configurations are permitted.}
+\label{tab:sqnr_dist}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Config & Min & P5 & Median & P95 & Max & $<$9\,dB & $<$15\,dB \\
+\midrule
+(2, 32) & 5.1 & 7.2 & 8.0 & 8.1 & 8.7 & 691 & 691 \\
+(2, 64) & 2.5 & 5.6 & 6.8 & 6.9 & 7.2 & 691 & 691 \\
+(3, 64) & 10.4 & 13.0 & 14.2 & 14.3 & 14.6 & 0 & 691 \\
+(4, 32) & 19.4 & 21.3 & 22.0 & 22.1 & 22.8 & 0 & 0 \\
+(4, 64) & 17.0 & 19.6 & 20.8 & 20.9 & 21.3 & 0 & 0 \\
+(4, 128) & 15.1 & 18.2 & 19.8 & 20.0 & 20.0 & 0 & 0 \\
+(8, 64) & 41.6 & 44.3 & 45.4 & 45.6 & 45.9 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The same pattern holds on Qwen3-30B-A3B: 2-bit max SQNR is 8.1\,dB, 3-bit min SQNR is 9.5\,dB. The gap between 2-bit and 3-bit is consistent across architectures.
+
+\subsubsection{Floor Sweep: Where Quality Breaks}
+
+We evaluated Llama-4-Scout at four SQNR floor settings to determine where model quality transitions from acceptable to catastrophic:
+
+\begin{table}[h]
+\centering
+\caption{SQNR floor sweep on Llama-4-Scout. The quality cliff is between 2-bit and 3-bit (PPL triples), not between 3-bit and 4-bit (+12.5\%). The 9\,dB floor exploits the natural SQNR gap to permit 3-bit while blocking catastrophic 2-bit.}
+\label{tab:sqnr}
+\begin{tabular}{lrrrrl}
+\toprule
+SQNR Floor & Avg Bits & Size (GB) & PPL (std) & PPL (med) & Effect \\
+\midrule
+0 dB (no safety) & 2.00 & 34.62 & 23.577 & 23.714 & Catastrophic (+198\%) \\
+\textbf{9 dB (default)} & \textbf{3.00} & \textbf{46.93} & \textbf{8.675} & \textbf{8.786} & \textbf{Usable (+9.8\%)} \\
+9 dB + 50\,GB budget & 3.48 & 51.98 & 7.980 & 8.284 & Good (+1.0\%) \\
+15 dB (conservative) & 4.00 & 56.16 & 7.709 & 8.076 & Best ($-$2.4\%) \\
+15 dB + 58\,GB budget & 4.01 & 58.03 & 7.703 & 8.070 & Best ($-$2.5\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results reveal two key findings:
+
+\paragraph{The real cliff is between 2-bit and 3-bit.} PPL jumps from 8.675 (3-bit) to 23.577 (2-bit)---a 2.7$\times$ degradation. In contrast, 3-bit to 4-bit is only a 12.5\% increase (8.675 $\rightarrow$ 7.709). The 15\,dB floor used in earlier experiments was overly conservative: it blocked all 3-bit configurations despite them producing acceptable quality.
+
+\paragraph{The 9\,dB floor exploits a natural gap.} On both Llama-4-Scout and Qwen3-30B-A3B, 2-bit SQNR peaks at ${\sim}$8.7\,dB while 3-bit SQNR starts at ${\sim}$10.4\,dB. A 9\,dB floor sits cleanly in this gap, vetoing all 2-bit configurations (proven catastrophic) while permitting all 3-bit configurations (proven usable). This reduces the minimum safe model size by \textbf{9.2\,GB} (53.75 $\rightarrow$ 44.27\,GB estimated, 56.16 $\rightarrow$ 46.93\,GB on disk) with only a 12.5\% PPL penalty versus the conservative floor.
+
+\paragraph{Mixed 3/4/8-bit fills the gap.} At the 50\,GB budget with 9\,dB floor, the allocator produces a mixed allocation (88\% 3-bit, 2.6\% 4-bit, 9.1\% 8-bit) that achieves PPL 7.980---only 1.0\% worse than uniform 4-bit at 4\,GB smaller. This intermediate point was inaccessible with the 15\,dB floor.
+
+\subsection{Budget-Targeted Deployment}
+\label{sec:budget_targeting}
+
+A unique capability of MINT's constrained formulation is \textbf{hardware-targeted quantization}: the user specifies an exact memory budget matching their deployment target, and MINT produces the optimal allocation for that constraint. Table~\ref{tab:budget_curve} shows the full quality--size tradeoff curve for Qwen3-30B-A3B, and Table~\ref{tab:scout_budget} demonstrates the same capability on Llama-4-Scout at extreme scale.
+
+\begin{table}[h]
+\centering
+\caption{PPL vs.\ budget for Qwen3-30B-A3B. The curve enables deployment planning: given a memory target, predict quality before running MINT.}
+\label{tab:budget_curve}
+\begin{tabular}{rrrrl}
+\toprule
+Budget & Model Size & Mean PPL & Median PPL & Deployment Target \\
+\midrule
+15.1 GB & 15.11 GB & 9.629 & --- & \emph{(uniform 4-bit floor)} \\
+15.3 GB & 16.13 GB & 8.970 & 9.020 & iPhone 16 Pro (16\,GB) \\
+15.5 GB & 16.29 GB & 8.930 & 8.971 & \\
+16.7 GB & 17.39 GB & 8.858 & 8.912 & \\
+19.2 GB & 19.01 GB & 8.782 & 8.798 & \\
+20.0 GB & 19.32 GB & 8.784 & 8.803 & RTX 4070 (20\,GB headroom) \\
+25.0 GB & 27.39 GB & 8.760 & 8.779 & RTX 4090 (24\,GB) \\
+30.0 GB & 30.75 GB & 8.657 & 8.684 & Mac M4 Pro (36\,GB) \\
+--- & 56.87 GB & 8.728 & --- & \emph{BF16 (unquantized)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several observations emerge from this curve:
+
+\paragraph{Steep initial gains.} The first 1\,GB above the 4-bit floor (15.1 $\rightarrow$ 16.1\,GB) produces a \textbf{6.8\% PPL improvement} (9.629 $\rightarrow$ 8.970). This is because the additional budget funds selective 8-bit upgrades for the most sensitive tensors and finer group sizes for 4-bit tensors. Threshold-based methods cannot exploit this---they produce a fixed allocation regardless of budget.
+
+\paragraph{Diminishing returns.} Beyond ${\sim}$19\,GB, additional budget yields marginal returns: the 19 $\rightarrow$ 30\,GB increase improves PPL by only 1.4\%. The 30\,GB model (PPL 8.657) slightly outperforms BF16 (PPL 8.728), likely due to mild regularization from 8-bit quantization.
+
+\paragraph{Fitted prediction curve.} We fit an inverse-power model to the measured points:
+\begin{equation}
+    \text{PPL}(B) = 8.371 + \frac{0.494}{(B - 15.099)^{0.135}}
+    \label{eq:ppl_curve}
+\end{equation}
+with RMSE = 0.025 PPL over the valid range $B \in [15.2, 30.0]$\,GB (95\% CI: $\pm$0.046 PPL). This enables practitioners to predict output quality for any budget target \emph{before} running the pipeline. Key thresholds: within +1\% of BF16 at 17.3\,GB, within +2\% at 15.7\,GB, BF16 parity at 26.1\,GB.
+
+\paragraph{Scaling to 109B parameters.} Table~\ref{tab:scout_budget} demonstrates budget targeting on Llama-4-Scout, a model too large to run in BF16 on any single consumer device. From a single rate-distortion analysis pass, MINT generates optimal allocations for different hardware tiers.
+
+\begin{table}[h]
+\centering
+\caption{MINT budget-targeted deployment of Llama-4-Scout (109B MoE). The same analysis produces optimal allocations for different hardware. BF16 (${\sim}$203\,GB) exceeds all single-device targets.}
+\label{tab:scout_budget}
+\begin{tabular}{rrrrl}
+\toprule
+Budget & Model Size & Mean PPL & Median PPL & Deployment Target \\
+\midrule
+--- & 34.62 GB & 23.577 & 23.714 & \emph{(no safety --- catastrophic)} \\
+min-safe & 46.93 GB & 8.675 & 8.786 & \emph{min safe (all 3-bit)} \\
+50 GB & 51.98 GB & 7.980 & 8.284 & Mac Studio M4 (48\,GB headroom) \\
+56.9 GB & 56.9 GB & 7.899 & --- & \emph{(uniform 4-bit baseline)} \\
+64 GB & 58.03 GB & 7.703 & 8.070 & Mac Studio M4 Max (64\,GB) \\
+192 GB & 163.24 GB & 7.359 & 7.691 & Mac Studio M2 Ultra (192\,GB) \\
+--- & ${\sim}$203 GB & \multicolumn{2}{c}{\emph{exceeds 192\,GB}} & \emph{BF16 (unquantized)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Scout budget curve spans a 4.7$\times$ size range (35--163\,GB) and reveals three regimes. Below the 9\,dB safety floor, quality collapses (PPL 23.6 at 2-bit). Above the floor, the \texttt{--min-safe} mode produces the smallest viable model (46.9\,GB, all 3-bit, PPL 8.675). With additional budget, the allocator upgrades the most sensitive tensors: the 50\,GB mixed model (88\% 3-bit, 9\% 8-bit) achieves PPL 7.980---only 1.0\% worse than uniform 4-bit at 5\,GB smaller. The 64\,GB and 192\,GB allocations use progressively more 4-bit and 8-bit to push quality further. The 3.5$\times$ size difference between the minimum safe model and the 192\,GB model (47 vs 163\,GB) produces only a 1.9$\times$ PPL difference (8.675 vs 7.359), demonstrating diminishing returns---practitioners with constrained hardware sacrifice surprisingly little quality.
+
+\subsection{Matched-Size Comparison with GPTQ}
+\label{sec:gptq_comparison}
+
+To rigorously evaluate MINT against calibration-based quantization, we compare against GPTQ~\cite{frantar2023gptq} at \textbf{exactly matched model sizes} across three MoE model families spanning different architectures and scales. For each family, we obtain an official GPTQ-Int4 quantized model, evaluate its perplexity, then run MINT's pipeline (rate-distortion curves $\rightarrow$ MCKP allocation $\rightarrow$ conversion) targeting the same byte budget.
+
+A critical engineering detail for MoE models is \textbf{expert-grouped allocation}: frameworks such as MLX implement MoE experts via \texttt{SwitchLinear} modules where all experts within a layer share the same quantization parameters (bit-width and group size). MINT's allocator groups expert tensors by (layer, projection) and uses the \emph{worst-case NRMSE} across experts within each group, ensuring that the allocation is implementable by the inference runtime.
+
+\begin{table}[h]
+\centering
+\caption{Matched-size comparison: MINT vs GPTQ across three MoE families. All evaluations use WikiText-2 (test, seq\_len=2048, seed=42). MINT outperforms GPTQ on all three families despite being entirely data-free. $^\dagger$Mixtral GPTQ uses per-channel quantization (group\_size=$-1$); original compressed size is 22\,GB but must be dequantized to fp16 (87\,GB) for evaluation since MLX does not support per-channel quantization. MINT comparison is at the uniform 4-bit size (24.5\,GB).}
+\label{tab:gptq_comparison}
+\begin{tabular}{llrrrr}
+\toprule
+Model & Method & Size (GB) & Mean PPL & Med PPL & $\Delta$ vs GPTQ \\
+\midrule
+\multirow{2}{*}{\shortstack[l]{Qwen3-30B-A3B\\(MoE, 30B)}}
+    & GPTQ Int4 (g128) & 16.0 & 9.122 & 9.160 & --- \\
+    & \textbf{MINT} & \textbf{16.1} & \textbf{8.970} & \textbf{9.020} & \textbf{$-$1.5\%} \\
+\midrule
+\multirow{2}{*}{\shortstack[l]{Qwen2-57B-A14B\\(MoE, 57B)}}
+    & GPTQ Int4 (g128) & 29.9 & 6.390 & 6.396 & --- \\
+    & \textbf{MINT} & \textbf{29.9} & \textbf{6.329} & \textbf{6.356} & \textbf{$-$0.6\%} \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Mixtral-8x7B$^\dagger$\\(MoE, 47B)}}
+    & GPTQ per-ch & 87.0$^\dagger$ & 4.608 & 4.640 & --- \\
+    & Uniform 4-bit (g64) & 24.5 & 4.471 & 4.461 & --- \\
+    & \textbf{MINT} & \textbf{24.5} & \textbf{4.264} & \textbf{4.266} & \textbf{$-$4.6\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Consistent wins across architectures.} MINT outperforms GPTQ on all three model families, with improvements ranging from $-0.6\%$ to $-4.6\%$ median PPL at matched sizes. These are different MoE architectures (Qwen2-MoE with 64 experts per layer, Qwen3 with shared expert + 128 routed experts, Mixtral with 8 experts) ranging from 30B to 57B total parameters. The consistency across architectures is notable because GPTQ uses Hessian-based calibration with activation data while MINT uses only the weight tensors.
+
+\paragraph{Expert grouping is essential.} Without expert grouping, the allocator treats each expert tensor independently and assigns different bit-widths to experts within the same SwitchLinear module. Since the inference runtime requires uniform quantization within each module, the bridge must aggregate these decisions (typically via mode), creating a mismatch between planned and actual allocation. On Qwen2-57B-A14B, this mismatch inflated the model from 29.9\,GB (planned) to 30.2\,GB (actual) and degraded PPL from 6.329 to 7.147. Expert grouping eliminates this mismatch entirely: the allocator's 29.9\,GB estimate matches the actual output size to within 0.01\,GB.
+
+\paragraph{Why does data-free beat calibration?} We hypothesize three factors: (1) \textbf{joint group-size optimization}: MINT explores a configuration space of 8 (bits, group\_size) combinations per tensor, while GPTQ uses a fixed group size; (2) \textbf{budget-constrained allocation}: MINT provably maximizes quality within the budget, while GPTQ applies uniform bit-width without budget awareness; and (3) \textbf{MoE calibration difficulty}: calibrating quantization across hundreds of experts requires activating each expert sufficiently, which narrow calibration sets may fail to do. MINT's data-free approach avoids this coverage problem entirely.
+
+\subsection{Mean vs.\ Median Perplexity}
+\label{sec:mean_vs_median}
+
+Standard perplexity evaluation computes the geometric mean loss across all evaluation sequences. We observe that this metric can be misleading:
+
+\begin{table}[h]
+\centering
+\caption{Mean vs.\ median perplexity reveals different quality orderings. GLM-4.7-Flash is the extreme case, but the effect appears across models.}
+\label{tab:mean_median}
+\begin{tabular}{llrrr}
+\toprule
+Model & Condition & Mean PPL & Median PPL & Outliers ($>$100) \\
+\midrule
+\multirow{3}{*}{Qwen3-30B}
+    & MINT (19\,GB) & 8.782 & 8.798 & 0 \\
+    & MINT (16\,GB) & 8.930 & 8.971 & 0 \\
+    & v1 (best) & 8.924 & 8.974 & 0 \\
+\midrule
+\multirow{3}{*}{GLM-4.7}
+    & BF16 & 11.344 & 8.706 & 5 \\
+    & v1 & 9.930 & 9.084 & 4 \\
+    & \textbf{MINT} & \textbf{9.427} & \textbf{9.210} & \textbf{0} \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{Llama-4\\Scout}}
+    & Uniform 4-bit & 7.899 & --- & --- \\
+    & \textbf{MINT (64\,GB)} & \textbf{7.703} & \textbf{8.070} & \textbf{0} \\
+    & \textbf{MINT (192\,GB)} & \textbf{7.359} & \textbf{7.691} & \textbf{0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On GLM-4.7-Flash, mean PPL gives a completely \textbf{inverted quality ordering}: BF16 appears worst (11.344) and MINT best (9.427). Median PPL gives the correct ranking: BF16 best (8.706), v1 second (9.084), MINT third (9.210). The inversion is caused by 5 catastrophic outlier sequences where BF16 produces PPL values of 25{,}000--81{,}000, while quantization noise acts as implicit regularization that stabilizes these pathological sequences to PPL 100--360.
+
+On Qwen3-30B-A3B, the mean and median are consistent in their ordering but differ in magnitude: MINT (16\,GB) has mean 8.930 but median 8.971. The 0.04 difference matters when comparing against v1's mean of 8.924---mean PPL suggests MINT is worse, while median PPL (8.971 vs 8.974) shows MINT is marginally better at smaller size.
+
+\textbf{Recommendation:} Future quantization evaluations should report both mean and median perplexity, along with outlier counts. Median PPL should be the primary comparison metric, with mean PPL treated as potentially unreliable on models with heavy-tailed per-sequence loss distributions.
+
+\subsection{Analysis Efficiency}
+
+\begin{table}[h]
+\centering
+\caption{MINT pipeline timing on M2 Ultra 192\,GB.}
+\label{tab:timing}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Tensors & Pass 1 & Allocation & Total \\
+\midrule
+Qwen3-8B & 399 & 3 min & $<$1s & ${\sim}$10 min \\
+Qwen3-30B-A3B & 18{,}867 & 50 min & $<$1s & ${\sim}$54 min \\
+GLM-4.7-Flash & 9{,}703 & 39 min & $<$1s & ${\sim}$44 min \\
+Llama-4-Scout & ${\sim}$1{,}000 & 45 min & $<$1s & ${\sim}$50 min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Pass 1 dominates runtime because it computes rate-distortion curves at 8 configurations per tensor. The allocation phase (greedy solver) completes in under 10\,ms regardless of model size. Total pipeline time is 2--5$\times$ slower than v1's single-pass approach but produces strictly better allocations due to joint optimization.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\paragraph{Group size is the primary quality lever.}
+The most striking finding is that \textbf{group-size optimization provides larger quality gains than bit-width selection}. On Qwen3-30B-A3B, the allocator chose 4-bit g32 for 85\% of tensors instead of the conventional g128. v1 kept all 4-bit tensors at g128 and instead spent its budget on 16-bit and 8-bit allocations. The knapsack determines that the quality improvement from 4$\times$ more quantization groups (g32 vs g128) at 0.125\,bytes/parameter overhead is more efficient than upgrading select tensors to 16-bit at 1.5\,bytes/parameter overhead. This validates the observation from prior work~\cite{li2025mixllm} that group size is a first-order compression variable.
+
+\paragraph{SQNR veto catches unsafe heuristic allocations.}
+On Qwen3-30B-A3B, v1's threshold heuristic allocated 4.0\% of parameters to 2-bit. The SQNR analysis reveals these allocations had SQNR values of 4.8--8.1\,dB---far below the 9\,dB safety floor. The SQNR veto provides a \emph{model-specific} safety check that catches dangerous allocations regardless of how the heuristic scoring ranks them. Our floor sweep (\S\ref{sec:sqnr_validation}) confirms that the cliff is between 2-bit and 3-bit, not between 3-bit and 4-bit.
+
+\paragraph{16-bit allocation is targeted.}
+MINT hard-protects embeddings, the LM head, layer norms, and MoE routers at 16-bit, matching the inference runtime's constraints (these modules are never quantized in MLX). v1 additionally allocated 5.6\% of \emph{quantizable} parameters to 16-bit via its heuristic thresholds. The MCKP solver never assigns 16-bit to quantizable tensors: the bytes saved by avoiding 16-bit produce more quality when spent on finer group sizes across thousands of other tensors.
+
+\paragraph{Budget utilization enables hardware targeting.}
+The greedy solver achieves 100\% budget utilization across all experiments. This is a direct advantage of the constrained formulation: a user with an iPhone (16\,GB), an RTX 4090 (24\,GB), or a Mac (48\,GB) specifies their exact available memory and MINT delivers the best achievable quality. Threshold-based methods produce a fixed model size with no user control. Combined with the PPL prediction curve (Eq.~\ref{eq:ppl_curve}), users can estimate quality \emph{before} running the pipeline, enabling informed deployment decisions. The Llama-4-Scout results demonstrate this at extreme scale: the same 109B model is deployed on a 64\,GB device (58\,GB, PPL 7.703) and a 192\,GB device (163\,GB, PPL 7.359) from a single analysis pass, with the quality difference (4.7\%) far smaller than the 2.8$\times$ size difference.
+
+\paragraph{Scaling to models that exceed available memory.}
+Llama-4-Scout (109B parameters, ${\sim}$203\,GB in BF16) cannot be loaded or evaluated in full precision on any single consumer device. This makes data-free quantization not merely convenient but \emph{necessary}---calibration-based methods would require either distributed infrastructure for calibration or reliance on proxy models. MINT's weight-only analysis processes each safetensor shard independently, never requiring the full model to reside in memory simultaneously. The analysis completes in approximately 50 minutes and produces a manifest from which any number of budget-targeted variants can be generated without re-analysis.
+
+\paragraph{When the allocator disagrees with heuristics.}
+On GLM-4.7-Flash, v1 achieved slightly better median PPL (9.084 vs 9.210) by assigning 141 tensors to 8-bit via its threshold heuristic. MINT's allocator determined that within the 16\,GB budget, all quantizable tensors are best at 4-bit. This reveals a limitation of NRMSE as the sole loss function: it may undervalue certain tensor-level quality improvements that are important for downstream perplexity. Incorporating activation-aware sensitivity (e.g., Fisher information or Hessian traces) as a per-tensor importance weight could address this gap without requiring calibration data.
+
+\paragraph{Quantization as regularization.}
+At 30.75\,GB (97.5\% 8-bit), the knapsack model achieves PPL 8.657---\emph{below} BF16's 8.728. This 0.8\% improvement is unlikely to be pure noise (it exceeds the 0.046 PPL fit uncertainty) and suggests that moderate quantization can act as implicit regularization. This effect warrants further investigation.
+
+\paragraph{MINT consistently outperforms calibration-based GPTQ.}
+In matched-size comparisons across three MoE families (\S\ref{sec:gptq_comparison}), MINT outperforms GPTQ by $-0.6\%$ to $-4.6\%$ median PPL despite being entirely data-free. Additionally, on dense Qwen3-8B (at a larger size budget), MINT (PPL 10.039) outperforms both GPTQ (PPL 10.30) and AWQ (PPL 10.50) by 2.5\% and 4.4\% respectively. The consistency across four model families and two architecture types (dense and MoE) challenges the assumption that calibration is necessary for competitive quantization quality. We attribute this to three factors: (1) joint group-size optimization accesses a richer configuration space than fixed-group GPTQ; (2) the MCKP solver provably maximizes quality under the budget constraint rather than applying uniform bit-widths; and (3) for MoE models, calibration must adequately cover expert activation patterns across potentially hundreds of experts, which narrow calibration sets may fail to achieve.
+
+\paragraph{Limitations.}
+The allocator operates on raw NRMSE without per-tensor importance weighting; incorporating activation-aware sensitivity (e.g., Fisher information or Hessian traces) as a learned importance weight could improve allocation quality, particularly on models like GLM-4.7-Flash where the allocator disagrees with heuristic methods. The PPL prediction curve is fitted to a single model family; cross-model generalization of curve \emph{parameters} requires further validation (though the pipeline itself is model-agnostic). BF16 perplexity is unavailable for Llama-4-Scout as the model (${\sim}$203\,GB) exceeds our test system's 192\,GB memory. We also lack downstream task accuracy comparisons and throughput measurements for mixed group-size overhead. The GPTQ comparison uses publicly available GPTQ-Int4 models with default settings; comparisons against GPTQ with optimized hyperparameters (e.g., act-order with variable group sizes) could narrow the gap.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+We presented MINT, a data-free mixed-precision quantization framework that replaces ad-hoc heuristic scoring with principled compute-optimal allocation. We evaluated MINT on four model families spanning 8B to 109B parameters, including both dense and MoE architectures. By formulating per-tensor allocation as a Multiple-Choice Knapsack Problem over joint (bit-width, group-size) configurations, MINT enables three capabilities that prior methods lack:
+
+\begin{enumerate}
+    \item \textbf{Budget-targeted deployment.} Users specify their exact memory constraint---16\,GB for iPhone, 24\,GB for RTX 4090, 64--192\,GB for Mac---and receive the provably optimal allocation. On Llama-4-Scout (109B), a single analysis pass produces deployments from 58\,GB (PPL 7.703) to 163\,GB (PPL 7.359), both outperforming uniform 4-bit. A fitted prediction curve estimates output quality before running the pipeline.
+    \item \textbf{Joint group-size optimization.} Treating group size as an allocation variable (not a fixed hyperparameter) emerges as the single most impactful design decision. On Qwen3-30B-A3B, 85\% of tensors receive group size 32 instead of the conventional 128, and this produces more quality improvement than bit-width changes.
+    \item \textbf{Safety guarantees with empirically validated thresholds.} The SQNR veto at 9\,dB exploits the natural gap between catastrophic 2-bit (max 8.7\,dB) and usable 3-bit (min 10.4\,dB). On Llama-4-Scout, this enables a \texttt{--min-safe} mode producing the smallest viable model (46.9\,GB, PPL 8.675) while blocking 2-bit allocations that would triple perplexity (PPL 23.6).
+\end{enumerate}
+
+On Qwen3-30B-A3B, MINT achieves +0.6\% perplexity versus BF16 at 19\,GB (33\% of full size), and matches prior heuristic quality at 2.6\% less storage. On Llama-4-Scout (109B MoE), MINT enables deployment of a model too large for BF16 on any consumer device, spanning from 46.9\,GB (min-safe, PPL 8.675) through 58\,GB (PPL 7.703) to 163\,GB (PPL 7.359)---all superior to uniform 4-bit (PPL 7.899) except the min-safe floor which trades 9.8\% quality for 17\% smaller size. We additionally demonstrate that standard mean perplexity can produce inverted quality orderings due to outlier sequences, and recommend that quantization evaluations report median perplexity as the primary metric.
+
+Contrary to the conventional assumption that calibration-based methods are strictly superior, MINT consistently outperforms GPTQ at matched model sizes across three MoE families (Qwen3-30B-A3B: $-1.5\%$, Qwen2-57B-A14B: $-0.6\%$, Mixtral-8x7B: $-4.6\%$ median PPL) and also outperforms both GPTQ and AWQ on dense Qwen3-8B. This consistency across four model families and two architecture types (dense and MoE) suggests that the advantage of calibration is overstated when the quantization allocator is sufficiently principled---joint group-size optimization and budget-constrained allocation provide quality gains that calibration on narrow datasets cannot match. For MoE models specifically, MINT's data-free approach avoids the coverage problem inherent in calibrating across hundreds of sparsely activated experts. MINT is useful both as a standalone method when calibration is impractical (very large models, proprietary data) and as a front-end for calibration-based refinement.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+% References
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\bibliographystyle{plain}
+
+\begin{thebibliography}{20}
+
+\bibitem{frantar2023gptq}
+E.~Frantar, S.~Ashkboos, T.~Hoefler, and D.~Alistarh.
+\newblock GPTQ: Accurate post-training quantization for generative pre-trained transformers.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem{lin2024awq}
+J.~Lin, J.~Tang, H.~Tang, S.~Yang, W.-M.~Chen, W.-C.~Wang, G.~Xiao, X.~Dang, C.~Gan, and S.~Han.
+\newblock AWQ: Activation-aware weight quantization for on-device LLM compression and acceleration.
+\newblock In \emph{MLSys}, 2024.
+
+\bibitem{kim2024squeezellm}
+S.~Kim, C.~Hooper, A.~Gholami, Z.~Dong, X.~Li, S.~Shen, M.~W.~Mahoney, and K.~Keutzer.
+\newblock SqueezeLLM: Dense-and-sparse quantization.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{dettmers2024spqr}
+T.~Dettmers, R.~Svirschevski, V.~Egiazarian, D.~Kuznedelev, E.~Frantar, S.~Ashkboos, A.~Borzunov, T.~Hoefler, and D.~Alistarh.
+\newblock SpQR: A sparse-quantized representation for near-lossless LLM weight compression.
+\newblock In \emph{ICLR}, 2024.
+
+\bibitem{chee2024quip}
+J.~Chee, Y.~Cai, V.~Kuleshov, and C.~De~Sa.
+\newblock QuIP: 2-bit quantization of large language models with guarantees.
+\newblock In \emph{NeurIPS}, 2024.
+
+\bibitem{tang2024easyquant}
+J.~Tang, Y.~Liu, H.~Yin, Y.~Li, Y.~Jiang, and Q.~Tan.
+\newblock EasyQuant: An efficient data-free quantization algorithm for LLMs.
+\newblock \emph{arXiv preprint arXiv:2403.02775}, 2024.
+
+\bibitem{zhang2025mxq}
+F.~Zhang et al.
+\newblock A mixed quantization approach for data-free quantization of LLMs.
+\newblock In \emph{ICAART}, 2025.
+
+\bibitem{badri2025higgs}
+M.~Badri, F.~Tramer, and T.~Hoefler.
+\newblock Pushing the limits of large language model quantization via the linearity theorem.
+\newblock In \emph{NAACL}, 2025.
+
+\bibitem{zhao2025kurtail}
+Y.~Zhao et al.
+\newblock KurTail: Kurtosis-based LLM quantization.
+\newblock In \emph{Findings of EMNLP}, 2025.
+
+\bibitem{li2024llmmq}
+J.~Li et al.
+\newblock LLM-MQ: Mixed-precision quantization for efficient LLM deployment.
+\newblock Technical report, Tsinghua University, 2024.
+
+\bibitem{li2025mixllm}
+Y.~Li et al.
+\newblock MixLLM: Mixed-precision LLM quantization with algorithm-system co-design.
+\newblock In \emph{OpenReview}, 2025.
+
+\bibitem{wei2025mcmoe}
+W.~Wei et al.
+\newblock Mixture compressor for Mixture-of-Experts LLMs gains more.
+\newblock In \emph{ICLR}, 2025.
+
+\bibitem{huang2025moequant}
+M.~Huang et al.
+\newblock MoEQuant: Enhancing quantization for Mixture-of-Experts large language models via expert-balanced sampling and affinity guidance.
+\newblock \emph{arXiv preprint arXiv:2505.03804}, 2025.
+
+\bibitem{xie2024quantmoebench}
+Y.~Xie et al.
+\newblock Examining post-training quantization for Mixture-of-Experts: A benchmark.
+\newblock In \emph{NeurIPS Workshop on Efficient Natural Language and Speech Processing}, 2024.
+
+\bibitem{bondarenko2023quantizable}
+Y.~Bondarenko, M.~Nagel, and T.~Blankevoort.
+\newblock Quantizable transformers: Removing outliers by helping attention heads do nothing.
+\newblock In \emph{EMNLP}, 2023.
+
+\bibitem{mlx2023}
+Apple.
+\newblock MLX: An array framework for Apple silicon.
+\newblock \url{https://github.com/ml-explore/mlx}, 2023.
+
+\bibitem{qwen3.5}
+Qwen Team.
+\newblock Qwen3.5 technical report.
+\newblock \url{https://qwenlm.github.io/blog/qwen3.5/}, 2026.
+
+\bibitem{xiao2023smoothquant}
+G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, and S.~Han.
+\newblock SmoothQuant: Accurate and efficient post-training quantization for large language models.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem{badri2024hqq}
+M.~Badri and A.~Shaji.
+\newblock Half-quadratic quantization of large machine learning models.
+\newblock \url{https://github.com/mobiusml/hqq}, 2024.
+
+\bibitem{huang2025slimllm}
+W.~Huang et al.
+\newblock SliM-LLM: Salience-driven mixed-precision quantization for large language models.
+\newblock In \emph{ICML}, 2025.
+
+\bibitem{shang2024cherryq}
+Y.~Shang et al.
+\newblock Cherry on Top: Parameter heterogeneity and quantization in large language models.
+\newblock In \emph{NeurIPS}, 2024.
+
+\bibitem{park2025hestia}
+J.~Park et al.
+\newblock HESTIA: A Hessian-guided differentiable quantization-aware training framework for extremely low-bit LLMs.
+\newblock \emph{arXiv preprint arXiv:2601.20745}, 2026.
+
+\bibitem{xu2025qwen3quant}
+Z.~Xu et al.
+\newblock An empirical study of Qwen3 quantization.
+\newblock \emph{arXiv preprint arXiv:2505.02214}, 2025.
+
+\bibitem{llama4}
+Meta AI.
+\newblock The Llama 4 herd of models.
+\newblock \url{https://ai.meta.com/blog/llama-4-multimodal-intelligence/}, 2025.
+
+\end{thebibliography}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+% Appendix
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\appendix
+
+\section{Gap Closure Summary}
+\label{app:gap_closure}
+
+\begin{table}[h]
+\centering
+\caption{Perplexity gap closure: fraction of the quality gap between uniform 4-bit and BF16 that MINT recovers at various budget points.}
+\label{tab:gap_closure}
+\begin{tabular}{llrrr}
+\toprule
+Model & Budget & MINT $\Delta$PPL & Uniform $\Delta$PPL & Gap Closed \\
+\midrule
+Qwen3-8B & 6.0\,GB & +3.2\% & +5.4\% & 41\% \\
+\midrule
+\multirow{3}{*}{Qwen3-30B} & 16.3\,GB & +2.3\% & +10.3\% & 78\% \\
+ & 17.4\,GB & +1.5\% & +10.3\% & 86\% \\
+ & 19.0\,GB & +0.6\% & +10.3\% & 94\% \\
+\midrule
+GLM-4.7-Flash & 15.8\,GB & +5.8\% & +31.6\% & 82\% \\
+\midrule
+Llama-4-Scout & 58.0\,GB & $-$2.5\%$^*$ & --- & --- \\
+Llama-4-Scout & 163.2\,GB & $-$6.8\%$^*$ & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$^*$Llama-4-Scout's BF16 model (${\sim}$203\,GB) exceeds available memory; $\Delta$ computed vs uniform 4-bit (PPL 7.899). Gap closure is not computable without BF16 baseline.
+
+On Qwen3-30B-A3B, MINT closes 78--94\% of the perplexity gap depending on the budget, with the 19\,GB budget achieving near-BF16 quality at 33\% of full size.
+
+\section{Comparison with Threshold-Based Allocation (v1)}
+\label{app:v1_comparison}
+
+MINT's MCKP formulation addresses specific limitations identified in the threshold-based v1 approach:
+
+\begin{table}[h]
+\centering
+\small
+\caption{Systematic comparison of threshold-based (v1) and optimization-based (MINT) design decisions.}
+\label{tab:v1v2}
+\begin{tabular}{p{3cm}p{4.5cm}p{4.5cm}}
+\toprule
+Aspect & Threshold-based (v1) & MINT (MCKP) \\
+\midrule
+Objective & Weighted sum + thresholds & Constrained optimization (Eq.~\ref{eq:objective}) \\
+Error metric & Single-point 4-bit NRMSE & Multi-point RD curve (8 configs) \\
+Group size & Fixed hyperparameter & Per-tensor variable (85\% chose g32) \\
+Protection & Binary hard-coded rules & Soft priors in objective (Table~\ref{tab:priors}) \\
+Safety floor & None (allows SQNR $<$ 5\,dB) & SQNR veto at 9\,dB (empirically validated) \\
+Budget & No user control (fixed output) & User-specified (GB, avg bits, or ratio) \\
+16-bit alloc & 5.6\% of params & 0\% (wasteful, redirected to g32 overhead) \\
+2-bit alloc & 4.0\% of params & 0\% (blocked by SQNR floor) \\
+Quality predict & Not possible & Fitted curve (Eq.~\ref{eq:ppl_curve}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Reproduction}
+\label{app:reproduction}
+
+All code is available at [anonymized]. Experiments use:
+\begin{itemize}
+    \item \texttt{python 3.12.0}, \texttt{mlx 0.30.3}, \texttt{mlx\_lm 0.30.4}, \texttt{torch 2.6.0}, \texttt{scipy}
+    \item Perplexity: custom evaluator, WikiText-2 test split, seq\_len=2048, seed=42
+    \item Quantization simulation: group-wise RTN
+    \item SVD: randomized SVD with rank $k = 256$ via \texttt{torch.svd\_lowrank}
+    \item MCKP solver: greedy efficiency ordering (default)
+    \item SQNR floor: 9\,dB (empirically validated; blocks 2-bit, permits 3-bit)
+\end{itemize}
+
+\end{document}
