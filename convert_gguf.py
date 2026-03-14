@@ -32,14 +32,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("mint.convert_gguf")
 
 # MINT (bits, group_size) → GGUF quant type mapping
-# K-quant types use mixed precision internally for optimal quality
+# NOTE: Use ggml_type names (Q4_K, Q3_K), NOT ftype names (Q4_K_M, Q3_K_M).
+# The _M/_S/_L suffixes are quantization modes, not tensor types.
 MINT_TO_GGUF = {
     (2, 32): "Q2_K",
     (2, 64): "Q2_K",
-    (3, 64): "Q3_K_M",
-    (4, 32): "Q4_K_M",
-    (4, 64): "Q4_K_M",
-    (4, 128): "Q4_K_M",
+    (3, 64): "Q3_K",
+    (4, 32): "Q4_K",
+    (4, 64): "Q4_K",
+    (4, 128): "Q4_K",
     (8, 64): "Q8_0",
     (8, 128): "Q8_0",
     (16, 0): "F16",
@@ -158,9 +159,9 @@ def mint_bits_to_gguf_type(bits: int, group_size: int) -> str:
     if bits <= 2:
         return "Q2_K"
     elif bits <= 3:
-        return "Q3_K_M"
+        return "Q3_K"
     elif bits <= 4:
-        return "Q4_K_M"
+        return "Q4_K"
     elif bits <= 6:
         return "Q6_K"
     elif bits <= 8:
@@ -234,7 +235,9 @@ def main():
     parser.add_argument("--manifest", help="MINT manifest JSON (alternative to --allocation)")
     parser.add_argument("--output", required=True, help="Output GGUF file path")
     parser.add_argument("--llama-cpp", help="Path to llama.cpp directory")
-    parser.add_argument("--default-type", default="Q4_K_M", help="Default quant type for unmapped tensors")
+    parser.add_argument("--default-type", default="Q2_K",
+                        help="Base quant type (default Q2_K to ensure all overrides apply; "
+                             "Q4_K_M causes silent override failures due to llama-quantize bug)")
     parser.add_argument("--keep-f16", action="store_true", help="Keep intermediate F16 GGUF file")
     args = parser.parse_args()
 
