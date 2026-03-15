@@ -239,7 +239,7 @@ Model & Condition & Size (GB) & Mean PPL & Median PPL & $\Delta$Med \\
     & \textbf{MINT} & \textbf{6.00} & \textbf{10.039} & --- & \textbf{+3.2\%} \\
 \midrule
 \multirow{6}{*}{\shortstack[l]{Qwen3-30B\\-A3B (MoE)}}
-    & BF16 baseline & 56.87 & 8.728 & --- & --- \\
+    & BF16 baseline & 56.87 & 8.733 & 8.789 & --- \\
     & Uniform 4-bit & 15.11 & 9.629 & --- & +10.3\% \\
     & v1 (best) & 16.73 & 8.924 & 8.974 & +2.8\% \\
     & \textbf{MINT (16\,GB)} & \textbf{16.29} & \textbf{8.930} & \textbf{8.971} & \textbf{+2.3\%} \\
@@ -395,7 +395,7 @@ Budget & Model Size & Mean PPL & Median PPL & Deployment Target \\
 20.0 GB & 19.32 GB & 8.784 & 8.803 & RTX 4070 (20\,GB headroom) \\
 25.0 GB & 27.39 GB & 8.760 & 8.779 & RTX 4090 (24\,GB) \\
 30.0 GB & 30.75 GB & 8.657 & 8.684 & Mac M4 Pro (36\,GB) \\
---- & 56.87 GB & 8.728 & --- & \emph{BF16 (unquantized)} \\
+--- & 56.87 GB & 8.733 & 8.789 & \emph{BF16 (unquantized)} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -404,7 +404,7 @@ Several observations emerge from this curve:
 
 \paragraph{Steep initial gains.} The first 1\,GB above the 4-bit floor (15.1 $\rightarrow$ 16.1\,GB) produces a \textbf{6.8\% PPL improvement} (9.629 $\rightarrow$ 8.970). This is because the additional budget funds selective 8-bit upgrades for the most sensitive tensors and finer group sizes for 4-bit tensors. Threshold-based methods cannot exploit this---they produce a fixed allocation regardless of budget.
 
-\paragraph{Diminishing returns.} Beyond ${\sim}$19\,GB, additional budget yields marginal returns: the 19 $\rightarrow$ 30\,GB increase improves PPL by only 1.4\%. The 30\,GB model (PPL 8.657) slightly outperforms BF16 (PPL 8.728), likely due to mild regularization from 8-bit quantization.
+\paragraph{Diminishing returns.} Beyond ${\sim}$19\,GB, additional budget yields marginal returns: the 19 $\rightarrow$ 30\,GB increase improves mean PPL by only 1.4\%. The 30\,GB model (mean PPL 8.657) appears to outperform BF16 (mean PPL 8.733), but controlled experiments (\S\ref{sec:quant_noise}) show this is a distributional artifact rather than genuine regularization.
 
 \paragraph{Fitted prediction curve.} We fit an inverse-power model to the measured points as a local empirical interpolation:
 \begin{equation}
@@ -553,8 +553,34 @@ Llama-4-Scout (109B parameters, ${\sim}$203\,GB in BF16) cannot be loaded or eva
 \paragraph{When the allocator disagrees with heuristics.}
 On GLM-4.7-Flash, v1 achieved slightly better median PPL (9.084 vs 9.210) by assigning 141 tensors to 8-bit via its threshold heuristic. MINT's allocator determined that within the 16\,GB budget, all quantizable tensors are best at 4-bit. This reveals a limitation of NRMSE as the sole loss function: it may undervalue certain tensor-level quality improvements that are important for downstream perplexity. Incorporating activation-aware sensitivity (e.g., Fisher information or Hessian traces) as a per-tensor importance weight could address this gap without requiring calibration data.
 
-\paragraph{Quantization as regularization.}
-At 30.75\,GB (97.5\% 8-bit), the knapsack model achieves PPL 8.657---\emph{below} BF16's 8.728. This 0.8\% improvement is unlikely to be pure noise (it exceeds the 0.046 PPL fit uncertainty) and suggests that moderate quantization can act as implicit regularization. This effect warrants further investigation.
+\paragraph{Does quantization act as regularization?}
+\label{sec:quant_noise}
+At 30.75\,GB (97.5\% 8-bit), MINT achieves mean PPL 8.657---apparently below BF16's 8.733. To test whether this reflects genuine regularization, we conducted controlled experiments on Qwen3-30B-A3B comparing BF16, uniform 8-bit quantization at two group sizes, uniform 6-bit, and Gaussian noise injection calibrated to match 8-bit quantization error magnitude ($\sigma$ matched per tensor, 385 tensors perturbed, average SNR 44.7\,dB).
+
+\begin{table}[h]
+\centering
+\caption{Controlled noise experiments on Qwen3-30B-A3B. Mean and median PPL diverge in opposite directions under all noise conditions, including unstructured Gaussian noise.}
+\label{tab:noise_experiment}
+\begin{tabular}{lrrrr}
+\toprule
+Condition & Size (GB) & Mean PPL & Median PPL & $\Delta$Med \\
+\midrule
+BF16 (baseline) & 56.87 & 8.733 & 8.789 & --- \\
+Gaussian noise ($1\times$) & 56.87 & 8.742 & 8.755 & $-$0.38\% \\
+Uniform 8-bit g64 & 30.21 & 8.750 & 8.765 & $-$0.27\% \\
+Uniform 8-bit g128 & 29.32 & 8.769 & 8.776 & $-$0.15\% \\
+Uniform 6-bit g64 & 23.11 & 8.765 & 8.798 & +0.10\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three findings emerge. First, \textbf{the mean PPL ``improvement'' is a distributional artifact}: all quantized conditions produce \emph{higher} mean PPL than BF16 (+0.11\% to +0.42\%), ruling out genuine regularization. The earlier observation of mean PPL below BF16 at the 30\,GB budget point was likely due to the specific MINT allocation pattern combined with evaluation variance.
+
+Second, \textbf{the median PPL improvement is real but not regularization-specific}. All 8-bit conditions show lower median PPL than BF16 ($-0.15\%$ to $-0.27\%$). However, matched-scale Gaussian noise produces the \emph{same} effect ($-0.38\%$), confirming this is a general noise phenomenon rather than anything specific to quantization's structured rounding. The mechanism is asymmetric perturbation of the per-sequence loss distribution: BF16 has a left tail of sequences with unusually low PPL, and any noise---structured or not---partially disrupts these, pulling median down while pushing mean up.
+
+Third, \textbf{per-sequence analysis reveals no selective improvement}. Comparing BF16 to uniform 8-bit across 145 WikiText-2 sequences, 68\% of sequences degrade and only 32\% improve, with the effect uniformly distributed across PPL quartiles (${\sim}+0.20\%$ per quartile). This rules out the hypothesis that quantization noise stabilizes pathological sequences on this model, unlike the genuine outlier stabilization observed on GLM-4.7-Flash (\S\ref{sec:mean_vs_median}).
+
+These results highlight a subtle evaluation pitfall: when mean and median perplexity diverge, apparent ``improvements'' from quantization may reflect distributional artifacts rather than genuine quality gains. This reinforces our recommendation (\S\ref{sec:mean_vs_median}) to report both metrics.
 
 \paragraph{MINT consistently outperforms calibration-based GPTQ.}
 In matched-size comparisons across three MoE families (\S\ref{sec:gptq_comparison}), MINT outperforms GPTQ by $-0.6\%$ to $-4.6\%$ median PPL despite being entirely data-free. Additionally, on dense Qwen3-8B (at a larger size budget), MINT (PPL 10.039) outperforms both GPTQ (PPL 10.30) and AWQ (PPL 10.50) by 2.5\% and 4.4\% respectively. The consistency across four model families and two architecture types (dense and MoE) challenges the assumption that calibration is necessary for competitive quantization quality. We attribute this to three factors: (1) joint group-size optimization accesses a richer configuration space than fixed-group GPTQ; (2) the MCKP solver targets quality maximization under an explicit budget constraint rather than applying uniform bit-widths; and (3) for MoE models, calibration must adequately cover expert activation patterns across potentially hundreds of experts, which narrow calibration sets may fail to achieve.
