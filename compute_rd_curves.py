@@ -42,13 +42,13 @@ def compute_nrmse(tensor: torch.Tensor, bits: int, group_size: int) -> float:
     if tensor.dim() < 2:
         return 0.0
 
-    # Handle 3D MoE expert tensors [num_experts, d_in, d_out]
-    if tensor.dim() == 3:
-        nrmses = [compute_nrmse(tensor[i], bits, group_size) for i in range(tensor.shape[0])]
-        return max(nrmses)  # worst-case across experts
-
-    t = tensor.float()
-    rows, cols = t.shape
+    # Handle 3D+ tensors: MoE expert tensors [num_experts, d_in, d_out] or vision patches
+    if tensor.dim() > 2:
+        t = tensor.reshape(-1, tensor.shape[-1]).float()
+        rows, cols = t.shape
+    else:
+        t = tensor.float()
+        rows, cols = t.shape
 
     # Pad columns to group_size multiple
     if cols % group_size != 0:

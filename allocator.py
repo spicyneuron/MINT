@@ -100,12 +100,19 @@ def compute_prior(
     return DEFAULT_PRIORS["default"]
 
 
-def _group_moe_experts(rd_data: Dict) -> Tuple[Dict, Dict]:
+def _group_moe_experts(rd_data: Dict, moe_aggregation: str = "weighted_mean") -> Tuple[Dict, Dict]:
     """Group MoE expert tensors by (layer, projection) for joint allocation.
 
     MLX's SwitchLinear requires all experts in a layer to share the same
-    quantization. This groups experts and uses worst-case NRMSE across experts
-    for each config, and sum of params for size estimation.
+    quantization. This groups experts and aggregates NRMSE across experts
+    for each config, and sums params for size estimation.
+
+    Args:
+        rd_data: Rate-distortion data with per-tensor curves.
+        moe_aggregation: How to aggregate NRMSE across experts in a group.
+            "weighted_mean" (default): parameter-weighted mean, consistent
+                with the additive global objective.
+            "max": worst-case (maximum) across experts (conservative).
 
     Returns:
         grouped_tensors: dict mapping group_name -> merged tensor data
@@ -128,7 +135,7 @@ def _group_moe_experts(rd_data: Dict) -> Tuple[Dict, Dict]:
     expert_members = {}
 
     for group_key, members in groups.items():
-        # Merge expert group: worst-case NRMSE, min SQNR, sum params
+        # Merge expert group: aggregated NRMSE, min SQNR, sum params
         total_params = sum(m[1]["num_params"] for m in members)
         layer_idx = members[0][1]["layer_idx"]
         is_1d = members[0][1]["is_1d"]
@@ -136,7 +143,6 @@ def _group_moe_experts(rd_data: Dict) -> Tuple[Dict, Dict]:
         merged_rd = {}
         merged_sqnr = {}
         if not is_1d:
-            # For each config, use worst-case (max NRMSE, min SQNR) across experts
             all_cfg_keys = set()
             for _, tdata in members:
                 all_cfg_keys.update(tdata["rd_curve"].keys())
@@ -146,7 +152,13 @@ def _group_moe_experts(rd_data: Dict) -> Tuple[Dict, Dict]:
                 nrmses = [m[1]["rd_curve"].get(cfg_key, 1.0) for m in members if not m[1]["is_1d"]]
                 sqnrs = [m[1]["sqnr"].get(cfg_key, 0.0) for m in members if not m[1]["is_1d"]]
                 if nrmses:
-                    merged_rd[cfg_key] = max(nrmses)  # worst-case
+                    if moe_aggregation == "weighted_mean":
+                        # Parameter-weighted mean: consistent with additive global loss
+                        params = [m[1]["num_params"] for m in members if not m[1]["is_1d"]]
+                        total_p = sum(params)
+                        merged_rd[cfg_key] = sum(n * p for n, p in zip(nrmses, params)) / total_p if total_p > 0 else max(nrmses)
+                    else:
+                        merged_rd[cfg_key] = max(nrmses)  # worst-case
                 if sqnrs:
                     merged_sqnr[cfg_key] = min(sqnrs)  # worst-case
 
@@ -171,6 +183,7 @@ def _group_moe_experts(rd_data: Dict) -> Tuple[Dict, Dict]:
 def build_tensor_specs(
     rd_data: Dict,
     total_layers: int,
+    moe_aggregation: str = "weighted_mean",
 ) -> Tuple[List[Dict], Dict]:
     """Build tensor specs for the allocator from RD curve data.
 
@@ -179,7 +192,7 @@ def build_tensor_specs(
         expert_members: dict mapping group names to member tensor names
     """
     # Group MoE experts for joint allocation
-    grouped_tensors, expert_members = _group_moe_experts(rd_data)
+    grouped_tensors, expert_members = _group_moe_experts(rd_data, moe_aggregation)
 
     specs = []
 
