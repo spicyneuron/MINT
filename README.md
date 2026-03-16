@@ -1,3 +1,11 @@
+<a href="https://baa.ai">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./baa-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./baa-logo.svg">
+    <img alt="Black Sheep AI" src="./baa-logo.svg" width="280">
+  </picture>
+</a>
+
 # MINT: Mixed-precision Integer Quantization via Rate-Distortion Optimization
 
 **MINT** (**M**emory-**I**nformed **N**-bit **T**uning) is a data-free, per-tensor mixed-precision quantization framework for large language models. Given a user-specified memory budget, MINT jointly selects the optimal (bit-width, group-size) configuration for each weight tensor by solving a Multiple-Choice Knapsack Problem (MCKP) over per-tensor rate-distortion curves.
