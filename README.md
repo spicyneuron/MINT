@@ -1,10 +1,12 @@
-<a href="https://baa.ai">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./baa-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./baa-logo.svg">
-    <img alt="Black Sheep AI" src="./baa-logo.svg" width="280">
-  </picture>
-</a>
+<p align="center">
+  <a href="https://baa.ai">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="./baa-logo-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="./baa-logo.svg">
+      <img alt="Black Sheep AI" src="./baa-logo.svg" width="390">
+    </picture>
+  </a>
+</p>
 
 # MINT: Mixed-precision Integer Quantization via Rate-Distortion Optimization
 
