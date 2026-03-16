@@ -14,7 +14,7 @@
 
 **No calibration data. No gradient computation. Under 50 minutes on commodity hardware.**
 
-** You choose the exact model size you want, MINT quantized the eact perfect quant for that size**
+**You choose the exact model size you want, MINT finds the optimal quantization for that size.**
 
 > **Paper**: [MINT: Compute-Optimal Data-Free Mixed-Precision Quantization for Large Language Models via Rate-Distortion Optimization](https://huggingface.co/spaces/baa-ai/MINT) (preprint)
 
@@ -111,7 +111,7 @@ python allocator.py --rd-curves rd_curves.json --min-safe   --output alloc-min-s
 python compute_rd_curves.py --model-dir /path/to/Model-BF16 --output rd_curves.json
 ```
 
-Loads each safetensor shard and simulates quantization at 8 configurations: `(2,32), (2,64), (3,64), (4,32), (4,64), (4,128), (8,64), (8,128)`. Measures NRMSE and SQNR for every 2D tensor. 3D MoE expert tensors use worst-case across experts.
+Loads each safetensor shard and simulates quantization at 8 configurations: `(2,32), (2,64), (3,64), (4,32), (4,64), (4,128), (8,64), (8,128)`. Measures NRMSE and SQNR for every 2D tensor. 3D MoE expert tensors are reshaped to 2D for joint analysis.
 
 **Runtime:** ~30 min for 30B, ~2 hours for 100B+.
 
@@ -177,9 +177,11 @@ The 9 dB threshold sits cleanly in this gap, providing an absolute quality floor
 ## MoE Expert Grouping
 
 For Mixture-of-Experts models, MLX's `SwitchLinear` module requires all experts in a layer to share quantization parameters. MINT groups expert tensors by (layer, projection) using:
-- Worst-case NRMSE across experts (conservative quality)
+- Parameter-weighted mean NRMSE across experts (consistent with additive global objective)
 - Minimum SQNR across experts (safety)
 - Sum of parameters (correct size accounting)
+
+The bridge handles both per-expert manifests (e.g., `experts.0.gate_proj`) and packed 3D expert tensors (e.g., `experts.gate_up_proj`), automatically mapping them to MLX's SwitchLinear modules.
 
 ## Pre-quantized Models
 
