@@ -244,7 +244,7 @@ If you use MINT in your research, please cite:
 ```bibtex
 @article{mint2026,
   title={MINT: Compute-Optimal Data-Free Mixed-Precision Quantization for Large Language Models via Rate-Distortion Optimization},
-  author={Kennedy, Trevor},
+  author={baa.ai},
   year={2026},
   url={https://github.com/baa-ai/MINT}
 }
