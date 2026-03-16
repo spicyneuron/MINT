@@ -4,6 +4,8 @@
 
 **No calibration data. No gradient computation. Under 50 minutes on commodity hardware.**
 
+** You choose the exact model size you want, MINT quantized the eact perfect quant for that size**
+
 > **Paper**: [MINT: Compute-Optimal Data-Free Mixed-Precision Quantization for Large Language Models via Rate-Distortion Optimization](https://huggingface.co/spaces/baa-ai/MINT) (preprint)
 
 ## Key Results
