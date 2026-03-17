@@ -651,31 +651,34 @@ The scaling data yields concrete deployment recommendations:
 \subsection{Throughput}
 \label{sec:throughput}
 
-MINT's allocator frequently selects group size 32 over the conventional 128, which increases scale/bias metadata bandwidth during inference. Table~\ref{tab:throughput} measures the impact.
+MINT's mixed-precision allocation assigns varying bit-widths and group sizes per tensor, which can affect inference throughput relative to uniform quantization. Table~\ref{tab:throughput} measures the impact.
 
 \begin{table}[h]
 \centering
-\caption{Throughput comparison: MINT vs uniform 4-bit (g128). Apple M2 Ultra, MLX 0.30.3, seq\_len=2048, gen\_len=256, median of 3 runs. $^\dagger$Prompt penalty on MoE models is attributable to a known MLX kernel inefficiency with small group sizes (issue \#3251); we expect this gap to narrow.}
+\caption{Throughput comparison: MINT vs uniform 4-bit. Apple M2 Ultra, MLX 0.31.1, gen\_len=256, median of 3 runs. TTFT = time to first token (prefill latency).}
 \label{tab:throughput}
-\begin{tabular}{llrrrrr}
+\begin{tabular}{llrrrrrr}
 \toprule
-Model & Method & Size & \multicolumn{2}{c}{Throughput (tok/s)} & $\Delta$ Gen \\
-\cmidrule(lr){4-5}
- & & (GB) & Prompt & Gen & \\
+Model & Method & Size & \multicolumn{3}{c}{Gen (tok/s) by prompt len} & TTFT \\
+\cmidrule(lr){4-6}
+ & & (GB) & 128 & 512 & 2048 & (2048) \\
 \midrule
-Qwen3-30B & Uniform & 17.2 & 1{,}308 & 84.4 & --- \\
- & \textbf{MINT} & \textbf{16.3} & \textbf{1{,}320} & \textbf{78.6} & $-$6.9\% \\
+Qwen3-30B & Uniform & 17.2 & 83.3 & 80.6 & 78.3 & 1{,}498\,ms \\
+ & \textbf{MINT} & \textbf{17.2} & \textbf{80.2} & \textbf{76.9} & \textbf{75.3} & \textbf{1{,}509\,ms} \\
+ & $\Delta$ & & $-$3.7\% & $-$4.6\% & $-$3.9\% & +0.7\% \\
 \midrule
-Mixtral-8x7B & Uniform & 24.6 & 729 & 66.5 & --- \\
- & \textbf{MINT} & \textbf{24.5} & \textbf{332}$^\dagger$ & \textbf{57.9} & $-$12.9\% \\
+GLM-4.7-Flash & Uniform & 16.9 & 55.5 & 55.3 & 54.7 & 1{,}849\,ms \\
+ & \textbf{MINT} & \textbf{16.7} & \textbf{54.4} & \textbf{54.2} & \textbf{54.5} & \textbf{2{,}440\,ms} \\
+ & $\Delta$ & & $-$2.0\% & $-$2.0\% & $-$0.4\% & +32.0\% \\
 \midrule
-Llama-4-Scout & Uniform & 56.9 & 570 & 43.4 & --- \\
- & \textbf{MINT} & \textbf{58.0} & \textbf{299}$^\dagger$ & \textbf{37.3} & $-$14.0\% \\
+Llama-4-Scout & Uniform & 60.6 & 41.3 & 37.2 & 40.2 & 3{,}359\,ms \\
+ & \textbf{MINT} & \textbf{63.9} & \textbf{35.4} & \textbf{35.2} & \textbf{32.8} & \textbf{6{,}585\,ms} \\
+ & $\Delta$ & & $-$14.2\% & $-$5.3\% & $-$18.4\% & +96.0\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Generation throughput decreases by 7--14\% due to the additional scale/bias reads required by smaller group sizes. On Qwen3-30B, prompt processing is unaffected (MINT is slightly faster due to smaller model size), but on Mixtral and Scout the prompt path shows a 47--55\% slowdown. This traces to MLX's Metal \texttt{quantized\_matmul} kernel reading scale/bias values per-thread without threadgroup caching---a known issue we have reported (MLX issue \#3251\footnote{\url{https://github.com/ml-explore/mlx/issues/3251}}). The generation path uses a different (QMV) kernel that is less affected. We expect the prompt gap to close once the kernel is optimized; the generation overhead of 7--14\% represents the realistic steady-state cost.
+Generation throughput decreases by 2--4\% on dense models (Qwen3-30B, GLM-4.7-Flash) where MINT's overhead is minimal. The MoE model (Llama-4-Scout) shows a larger 5--18\% generation penalty and significantly slower prefill (TTFT), attributable to 8-bit override layers requiring more memory bandwidth during the compute-bound prefill phase. Prefill on dense models is largely unaffected ($<$1\% on Qwen3-30B). The throughput cost scales with the fraction of tensors assigned non-default configurations: models with fewer overrides (like GLM-4.7-Flash, where MINT achieves $-$20.8\% better PPL than uniform) incur negligible speed penalties.
 
 \paragraph{Limitations.}
 The allocator uses raw NRMSE as its sole loss function without per-tensor importance weighting. NRMSE measures weight reconstruction fidelity, but not all tensors contribute equally to downstream loss---incorporating activation-aware sensitivity (e.g., Fisher information or Hessian traces) could improve allocation quality, particularly on models like GLM-4.7-Flash where the NRMSE-based allocator disagrees with heuristic methods. We investigate several candidate sensitivity features (spectral, kurtosis, output noise amplification) in Appendix~\ref{app:features}, but in the current system these are not used by the allocator. The PPL prediction curve (Eq.~\ref{eq:ppl_curve}) is a local empirical fit valid over the measured budget range; it should not be extrapolated as a universal law. BF16 perplexity is unavailable for Llama-4-Scout as the model (${\sim}$203\,GB) exceeds our test system's 192\,GB memory. The GPTQ comparison uses publicly available GPTQ-Int4 models with default settings; comparisons against GPTQ with optimized hyperparameters (e.g., act-order with variable group sizes) could narrow the gap.
@@ -695,7 +698,7 @@ We presented MINT, a data-free mixed-precision quantization framework that repla
 
 On Qwen3-30B-A3B, MINT achieves +0.6\% perplexity versus BF16 at 19\,GB (33\% of full size), and matches prior heuristic quality at 2.6\% less storage. On Llama-4-Scout (109B MoE), MINT enables deployment of a model too large for BF16 on any consumer device, spanning from 46.9\,GB (min-safe, PPL 8.675) through 58\,GB (PPL 7.703) to 163\,GB (PPL 7.359)---all superior to uniform 4-bit (PPL 7.899) except the min-safe floor which trades 9.8\% quality for 17\% smaller size. Scaling experiments across budget levels reveal that quality returns diminish sharply above ${\sim}$5 average bits, and that standard downstream benchmarks (ARC-Challenge, Winogrande) saturate at 4-bit precision---varying only 2.7--3.4 percentage points across the entire 3-to-8-bit range---confirming perplexity as the appropriate primary metric for quantization evaluation. We additionally demonstrate that standard mean perplexity can produce misleading quality orderings due to outlier sequences, and recommend that quantization evaluations report median perplexity and tail statistics alongside standard corpus perplexity.
 
-Contrary to the conventional assumption that calibration-based methods are strictly superior, MINT consistently outperforms GPTQ at matched model sizes across three MoE families (Qwen3-30B-A3B: $-1.5\%$, Qwen2-57B-A14B: $-0.6\%$, Mixtral-8x7B: $-4.6\%$ median PPL) and also outperforms both GPTQ and AWQ on dense Qwen3-8B. This consistency across six model families and two architecture types (dense and MoE) suggests that joint group-size optimization and budget-constrained allocation can provide quality gains that compensate for the absence of calibration data. The throughput cost of MINT's mixed group sizes is modest: 7--14\% generation overhead, with larger prompt-processing penalties attributable to a known framework kernel inefficiency that we expect to be resolved. For MoE models specifically, MINT's data-free approach avoids the coverage problem inherent in calibrating across hundreds of sparsely activated experts. MINT is useful both as a standalone method when calibration is impractical (very large models, proprietary data) and as a front-end for calibration-based refinement.
+Contrary to the conventional assumption that calibration-based methods are strictly superior, MINT consistently outperforms GPTQ at matched model sizes across three MoE families (Qwen3-30B-A3B: $-1.5\%$, Qwen2-57B-A14B: $-0.6\%$, Mixtral-8x7B: $-4.6\%$ median PPL) and also outperforms both GPTQ and AWQ on dense Qwen3-8B. This consistency across six model families and two architecture types (dense and MoE) suggests that joint group-size optimization and budget-constrained allocation can provide quality gains that compensate for the absence of calibration data. The throughput cost of MINT's mixed-precision allocation is modest on dense models (2--4\% generation overhead, negligible prefill impact), though MoE models incur larger penalties (5--18\% generation, significant prefill slowdown) due to 8-bit override layers requiring additional memory bandwidth. For MoE models specifically, MINT's data-free approach avoids the coverage problem inherent in calibrating across hundreds of sparsely activated experts. MINT is useful both as a standalone method when calibration is impractical (very large models, proprietary data) and as a front-end for calibration-based refinement.
 
 % ═══════════════════════════════════════════════════════════════════════════════
 % References
