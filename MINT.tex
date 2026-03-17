@@ -215,7 +215,7 @@ We evaluate MINT on six model families using WikiText-2 perplexity (test split, 
 
 \textbf{Models:} Qwen3-8B (dense, 8.2B parameters), Qwen3-30B-A3B (MoE, 30.5B parameters, 128 routed experts), Qwen2-57B-A14B (MoE, 57.4B parameters, 64 experts/layer), Mixtral-8x7B-Instruct (MoE, 46.7B parameters, 8 experts/layer), GLM-4.7-Flash (dense, 31.2B parameters), and Llama-4-Scout-17B-16E-Instruct (MoE, 109B parameters, 16 routed + 1 shared expert/layer).
 
-\textbf{Baselines:} BF16 (unquantized), uniform 4-bit RTN with group size 64 or 128, GPTQ-Int4 where available, and the threshold-based v1 heuristic.
+\textbf{Baselines:} BF16 (unquantized), uniform 4-bit RTN with group size 64 or 128, GPTQ-Int4 where available, and the threshold-based SWAN heuristic.
 
 \subsection{Main Results: Matched-Budget Perplexity}
 \label{sec:main_results}
@@ -234,19 +234,19 @@ Qwen3-8B & BF16 baseline & 15.26 & 9.727 & --- & --- \\
  & AWQ 4-bit$^\dagger$ & 4.05 & 10.50 & --- & +8.1\% \\
  & GPTQ 4-bit$^\dagger$ & 4.05 & 10.30 & --- & +6.1\% \\
  & Uniform 4-bit & 4.05 & 10.249 & --- & +5.4\% \\
- & v1 (best) & 6.05 & 10.097 & --- & +3.8\% \\
+ & SWAN (best) & 6.05 & 10.097 & --- & +3.8\% \\
  & \textbf{MINT} & \textbf{6.00} & \textbf{10.039} & --- & \textbf{+3.2\%} \\
 \midrule
 Qwen3-30B-A3B & BF16 baseline & 56.87 & 8.733 & 8.789 & --- \\
 (MoE) & Uniform 4-bit & 15.11 & 9.629 & --- & +10.3\% \\
- & v1 (best) & 16.73 & 8.924 & 8.974 & +2.8\% \\
+ & SWAN (best) & 16.73 & 8.924 & 8.974 & +2.8\% \\
  & \textbf{MINT (16\,GB)} & \textbf{16.29} & \textbf{8.930} & \textbf{8.971} & \textbf{+2.3\%} \\
  & \textbf{MINT (17\,GB)} & \textbf{17.39} & \textbf{8.858} & \textbf{8.912} & \textbf{+1.5\%} \\
  & \textbf{MINT (19\,GB)} & \textbf{19.01} & \textbf{8.782} & \textbf{8.798} & \textbf{+0.6\%} \\
 \midrule
 GLM-4.7-Flash & BF16 baseline & 58.16 & 11.344 & 8.706 & --- \\
  & Uniform 4-bit & 14.82 & --- & ${\sim}$11.46 & +31.6\% \\
- & v1 (best) & 15.92 & 9.930 & 9.084 & +4.3\% \\
+ & SWAN (best) & 15.92 & 9.930 & 9.084 & +4.3\% \\
  & \textbf{MINT} & \textbf{15.82} & \textbf{9.427} & \textbf{9.210} & \textbf{+5.8\%} \\
 \midrule
 Llama-4-Scout$^\ddagger$ & BF16 baseline & ${\sim}$203 & \multicolumn{2}{c}{\emph{exceeds 192\,GB}} & --- \\
@@ -254,24 +254,24 @@ Llama-4-Scout$^\ddagger$ & BF16 baseline & ${\sim}$203 & \multicolumn{2}{c}{\emp
  & \textbf{MINT (min-safe)} & \textbf{46.93} & \textbf{8.675} & \textbf{8.786} & \textbf{+9.8\%} \\
  & \textbf{MINT (50\,GB)} & \textbf{51.98} & \textbf{7.980} & \textbf{8.284} & \textbf{+1.0\%} \\
  & Uniform 4-bit & 56.9 & 7.899 & --- & --- \\
- & v1 (best) & 59.5 & 7.628 & --- & $-$3.4\% \\
+ & SWAN (best) & 59.5 & 7.628 & --- & $-$3.4\% \\
  & \textbf{MINT (64\,GB)} & \textbf{58.03} & \textbf{7.703} & \textbf{8.070} & \textbf{$-$2.5\%} \\
  & \textbf{MINT (192\,GB)} & \textbf{163.24} & \textbf{7.359} & \textbf{7.691} & \textbf{$-$6.8\%} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Qwen3-8B (dense).} MINT achieves PPL 10.039 at 6.00\,GB, outperforming the best v1 configuration (PPL 10.097 at 6.05\,GB) by 0.6\%. The improvement is attributable to joint group-size optimization: MINT assigns group size 32 to 29 tensors, group size 64 to 46, and group size 128 to 101, directing finer granularity to the most sensitive tensors. MINT closes 41\% of the gap between uniform 4-bit and BF16.
+\paragraph{Qwen3-8B (dense).} MINT achieves PPL 10.039 at 6.00\,GB, outperforming the best SWAN configuration (PPL 10.097 at 6.05\,GB) by 0.6\%. The improvement is attributable to joint group-size optimization: MINT assigns group size 32 to 29 tensors, group size 64 to 46, and group size 128 to 101, directing finer granularity to the most sensitive tensors. MINT closes 41\% of the gap between uniform 4-bit and BF16.
 
 \paragraph{Comparison with calibration-based methods (dense).} Published results from an independent evaluation~\cite{xu2025qwen3quant} report GPTQ (PPL 10.30) and AWQ (PPL 10.50) for Qwen3-8B at uniform 4-bit (g128). MINT (PPL 10.039) outperforms both \emph{despite requiring no calibration data}: $-2.5\%$ versus GPTQ and $-4.4\%$ versus AWQ (Table~\ref{tab:main_results}). MINT's advantage comes at a size cost (6.00\,GB vs 4.05\,GB), but this is precisely the budget-targeted tradeoff MINT is designed for: given more memory, it delivers better quality than calibration-based methods achieve with less.
 
 \paragraph{Qwen3-30B-A3B (MoE).} This model demonstrates MINT's budget-targeting capability. At three different user-specified budgets, MINT achieves 100\% budget utilization with monotonically improving quality:
 \begin{itemize}
-    \item At 16.29\,GB: PPL 8.930, matching v1's quality (8.924) at \textbf{2.6\% less storage}
-    \item At 17.39\,GB: PPL 8.858, surpassing v1 by 0.7\%
+    \item At 16.29\,GB: PPL 8.930, matching SWAN's quality (8.924) at \textbf{2.6\% less storage}
+    \item At 17.39\,GB: PPL 8.858, surpassing SWAN by 0.7\%
     \item At 19.01\,GB: PPL 8.782, within \textbf{0.6\% of BF16} at just 33\% of full size
 \end{itemize}
-The greedy solver allocated 18{,}867 tensors in under 20\,ms. The SQNR safety veto blocked all 2-bit configurations on this model (max SQNR: 8.1\,dB, below the 9\,dB floor), catching unsafe allocations that v1's heuristic thresholds allowed (4\% of parameters at 2-bit with SQNR below 8\,dB). 3-bit configurations (min SQNR: 9.5\,dB) pass the veto and are available to the allocator at tighter budgets.
+The greedy solver allocated 18{,}867 tensors in under 20\,ms. The SQNR safety veto blocked all 2-bit configurations on this model (max SQNR: 8.1\,dB, below the 9\,dB floor), catching unsafe allocations that SWAN's heuristic thresholds allowed (4\% of parameters at 2-bit with SQNR below 8\,dB). 3-bit configurations (min SQNR: 9.5\,dB) pass the veto and are available to the allocator at tighter budgets.
 
 \paragraph{GLM-4.7-Flash.} MINT achieves median PPL 9.210 at 15.82\,GB, closing 82\% of the gap between uniform 4-bit and BF16. On this model, mean PPL is misleading: BF16 exhibits 5 catastrophic outlier sequences (PPL 25{,}000--81{,}000), inflating the mean to 11.344, while quantized models stabilize these sequences (see \S\ref{sec:mean_vs_median}).
 
@@ -307,7 +307,7 @@ Config $(b, g)$ & Tensors & \% & Role \\
 \end{tabular}
 \end{table}
 
-The dominant pattern is striking: \textbf{85\% of tensors receive 4-bit quantization with group size 32}, not the conventional group size 128. The allocator discovers that reducing group size from 128 to 32 trades 0.125 bytes/parameter of scale/bias overhead for substantially better per-group quantization resolution. This overhead is funded by eliminating all 16-bit allocations for quantizable tensors---v1 allocated 5.6\% of parameters to 16-bit, but the knapsack determines this is wasteful: those bytes produce more quality when redistributed as finer group sizes across 4-bit tensors.
+The dominant pattern is striking: \textbf{85\% of tensors receive 4-bit quantization with group size 32}, not the conventional group size 128. The allocator discovers that reducing group size from 128 to 32 trades 0.125 bytes/parameter of scale/bias overhead for substantially better per-group quantization resolution. This overhead is funded by eliminating all 16-bit allocations for quantizable tensors---SWAN allocated 5.6\% of parameters to 16-bit, but the knapsack determines this is wasteful: those bytes produce more quality when redistributed as finer group sizes across 4-bit tensors.
 
 The 8-bit allocations (14\%) concentrate on first-layer attention tensors (prior $\pi = 3.0$), last-layer attention (prior $\pi = 2.0$), and the most sensitive MoE expert weights. Embeddings and the LM head remain at 4-bit despite their prior of $\pi = 10.0$---they are too large for 8-bit upgrades to be efficient.
 
@@ -503,10 +503,10 @@ Model & Condition & Mean PPL & Median PPL & Outliers ($>$100) \\
 \midrule
 Qwen3-30B & MINT (19\,GB) & 8.782 & 8.798 & 0 \\
  & MINT (16\,GB) & 8.930 & 8.971 & 0 \\
- & v1 (best) & 8.924 & 8.974 & 0 \\
+ & SWAN (best) & 8.924 & 8.974 & 0 \\
 \midrule
 GLM-4.7 & BF16 & 11.344 & 8.706 & 5 \\
- & v1 & 9.930 & 9.084 & 4 \\
+ & SWAN & 9.930 & 9.084 & 4 \\
  & \textbf{MINT} & \textbf{9.427} & \textbf{9.210} & \textbf{0} \\
 \midrule
 Llama-4-Scout & Uniform 4-bit & 7.899 & --- & --- \\
@@ -516,9 +516,9 @@ Llama-4-Scout & Uniform 4-bit & 7.899 & --- & --- \\
 \end{tabular}
 \end{table}
 
-On GLM-4.7-Flash, mean PPL gives a completely \textbf{inverted quality ordering}: BF16 appears worst (11.344) and MINT best (9.427). Median PPL gives the correct ranking: BF16 best (8.706), v1 second (9.084), MINT third (9.210). The inversion is caused by 5 catastrophic outlier sequences where BF16 produces PPL values of 25{,}000--81{,}000, while quantization noise acts as implicit regularization that stabilizes these pathological sequences to PPL 100--360.
+On GLM-4.7-Flash, mean PPL gives a completely \textbf{inverted quality ordering}: BF16 appears worst (11.344) and MINT best (9.427). Median PPL gives the correct ranking: BF16 best (8.706), SWAN second (9.084), MINT third (9.210). The inversion is caused by 5 catastrophic outlier sequences where BF16 produces PPL values of 25{,}000--81{,}000, while quantization noise acts as implicit regularization that stabilizes these pathological sequences to PPL 100--360.
 
-On Qwen3-30B-A3B, the mean and median are consistent in their ordering but differ in magnitude: MINT (16\,GB) has mean 8.930 but median 8.971. The 0.04 difference matters when comparing against v1's mean of 8.924---mean PPL suggests MINT is worse, while median PPL (8.971 vs 8.974) shows MINT is marginally better at smaller size.
+On Qwen3-30B-A3B, the mean and median are consistent in their ordering but differ in magnitude: MINT (16\,GB) has mean 8.930 but median 8.971. The 0.04 difference matters when comparing against SWAN's mean of 8.924---mean PPL suggests MINT is worse, while median PPL (8.971 vs 8.974) shows MINT is marginally better at smaller size.
 
 \textbf{Recommendation:} Future quantization evaluations should report standard corpus perplexity (token-weighted cross-entropy) as the primary metric, supplemented by median per-sequence PPL, tail percentiles (P95, P99), and outlier counts as robustness diagnostics. When the per-sequence loss distribution is heavy-tailed, mean per-sequence PPL can produce misleading orderings; reporting both gives a more complete picture of quantization quality.
 
@@ -540,7 +540,7 @@ Llama-4-Scout & ${\sim}$1{,}000 & 45 min & $<$1s & ${\sim}$50 min \\
 \end{tabular}
 \end{table}
 
-Pass 1 dominates runtime because it computes rate-distortion curves at 8 configurations per tensor. The allocation phase (greedy solver) completes in under 10\,ms regardless of model size. Total pipeline time is 2--5$\times$ slower than v1's single-pass approach but produces strictly better allocations due to joint optimization.
+Pass 1 dominates runtime because it computes rate-distortion curves at 8 configurations per tensor. The allocation phase (greedy solver) completes in under 10\,ms regardless of model size. Total pipeline time is 2--5$\times$ slower than SWAN's single-pass approach but produces strictly better allocations due to joint optimization.
 
 % ═══════════════════════════════════════════════════════════════════════════════
 \section{Discussion}
@@ -555,10 +555,10 @@ Our experiments across six model families yield several findings that extend bey
 \begin{enumerate}
 
 \item \textbf{Group size is the primary quality lever---more impactful than bit-width selection.}
-On Qwen3-30B-A3B, the MCKP allocator chose 4-bit with group size 32 for 85\% of tensors instead of the conventional group size 128. The v1 heuristic kept all 4-bit tensors at g128 and spent its budget on 16-bit and 8-bit upgrades instead. The knapsack solver discovers that $4\times$ more quantization groups (g32 vs g128) at 0.125\,bytes/parameter overhead is more efficient than upgrading select tensors to 8-bit or 16-bit at 0.5--1.5\,bytes/parameter. Consequently, MINT \emph{never} assigns 16-bit to quantizable tensors---the bytes are always better spent on finer group sizes across thousands of other tensors. This validates the observation from prior work~\cite{li2025mixllm} that group size is a first-order compression variable and suggests that future quantization methods should treat group size as an allocation variable rather than a fixed hyperparameter.
+On Qwen3-30B-A3B, the MCKP allocator chose 4-bit with group size 32 for 85\% of tensors instead of the conventional group size 128. The SWAN heuristic kept all 4-bit tensors at g128 and spent its budget on 16-bit and 8-bit upgrades instead. The knapsack solver discovers that $4\times$ more quantization groups (g32 vs g128) at 0.125\,bytes/parameter overhead is more efficient than upgrading select tensors to 8-bit or 16-bit at 0.5--1.5\,bytes/parameter. Consequently, MINT \emph{never} assigns 16-bit to quantizable tensors---the bytes are always better spent on finer group sizes across thousands of other tensors. This validates the observation from prior work~\cite{li2025mixllm} that group size is a first-order compression variable and suggests that future quantization methods should treat group size as an allocation variable rather than a fixed hyperparameter.
 
 \item \textbf{The SQNR safety veto exploits a natural gap between 2-bit and 3-bit quantization.}
-Across all tested architectures, 2-bit SQNR peaks at ${\sim}$8.7\,dB while 3-bit SQNR starts at ${\sim}$10.4\,dB, leaving a ${\sim}$2\,dB gap where no valid configurations exist. Setting the floor at 9\,dB cleanly separates catastrophic quantization (PPL triples at 2-bit) from usable quantization (PPL degrades only 12.5\% at 3-bit). On Qwen3-30B-A3B, the v1 heuristic allocated 4.0\% of parameters to 2-bit with SQNR values of 4.8--8.1\,dB; the veto catches all of these. This natural gap appears consistent across dense and MoE architectures and may be a useful design principle for other quantization methods.
+Across all tested architectures, 2-bit SQNR peaks at ${\sim}$8.7\,dB while 3-bit SQNR starts at ${\sim}$10.4\,dB, leaving a ${\sim}$2\,dB gap where no valid configurations exist. Setting the floor at 9\,dB cleanly separates catastrophic quantization (PPL triples at 2-bit) from usable quantization (PPL degrades only 12.5\% at 3-bit). On Qwen3-30B-A3B, the SWAN heuristic allocated 4.0\% of parameters to 2-bit with SQNR values of 4.8--8.1\,dB; the veto catches all of these. This natural gap appears consistent across dense and MoE architectures and may be a useful design principle for other quantization methods.
 
 \item \textbf{Standard mean perplexity can produce misleading quality orderings.}
 On GLM-4.7-Flash, mean PPL gives a \emph{completely inverted} ranking: BF16 appears worst (11.344) and MINT best (9.427), while median PPL gives the correct ordering (BF16 8.706, MINT 9.210). The inversion is caused by 5 catastrophic outlier sequences (PPL 25{,}000--81{,}000) in BF16. Controlled noise experiments on Qwen3-30B-A3B (Table~\ref{tab:noise_experiment}) confirm that apparent ``regularization'' from quantization is a distributional artifact: matched-scale Gaussian noise produces the same median shift ($-0.38\%$), and 68\% of individual sequences degrade. We recommend reporting median PPL and tail statistics alongside standard corpus perplexity.
@@ -603,7 +603,7 @@ Uniform 6-bit g64 & 23.11 & 8.765 & 8.798 & +0.10\% \\
 All quantized conditions produce \emph{higher} mean PPL than BF16, ruling out genuine regularization. The median improvement ($-0.15\%$ to $-0.27\%$) is replicated by matched-scale Gaussian noise ($-0.38\%$), confirming it is a general noise phenomenon: BF16 has a left tail of sequences with unusually low PPL, and any perturbation---structured or not---partially disrupts these, pulling median down while pushing mean up. Per-sequence analysis shows 68\% of sequences degrade under 8-bit quantization, uniformly distributed across PPL quartiles, ruling out selective stabilization.
 
 \paragraph{When the allocator disagrees with heuristics.}
-On GLM-4.7-Flash, the v1 heuristic achieved slightly better median PPL (9.084 vs 9.210) by assigning 141 tensors to 8-bit. MINT's allocator determined that within the 16\,GB budget, all quantizable tensors are best at 4-bit. This reveals a limitation of NRMSE as the sole loss function: it may undervalue certain tensor-level quality improvements important for downstream perplexity. Incorporating activation-aware sensitivity (e.g., Fisher information) as a per-tensor importance weight could address this gap.
+On GLM-4.7-Flash, the SWAN heuristic achieved slightly better median PPL (9.084 vs 9.210) by assigning 141 tensors to 8-bit. MINT's allocator determined that within the 16\,GB budget, all quantizable tensors are best at 4-bit. This reveals a limitation of NRMSE as the sole loss function: it may undervalue certain tensor-level quality improvements important for downstream perplexity. Incorporating activation-aware sensitivity (e.g., Fisher information) as a per-tensor importance weight could address this gap.
 
 \subsection{Downstream Benchmarks}
 \label{sec:downstream_benchmarks}
@@ -870,19 +870,19 @@ $^*$Llama-4-Scout's BF16 model (${\sim}$203\,GB) exceeds available memory; $\Del
 
 On Qwen3-30B-A3B, MINT closes 78--94\% of the perplexity gap depending on the budget, with the 19\,GB budget achieving near-BF16 quality at 33\% of full size.
 
-\section{Comparison with Threshold-Based Allocation (v1)}
+\section{Comparison with Threshold-Based Allocation (SWAN)}
 \label{app:v1_comparison}
 
-MINT's MCKP formulation addresses specific limitations identified in the threshold-based v1 approach:
+MINT's MCKP formulation addresses specific limitations identified in the threshold-based SWAN approach:
 
 \begin{table}[h]
 \centering
 \small
-\caption{Systematic comparison of threshold-based (v1) and optimization-based (MINT) design decisions.}
+\caption{Systematic comparison of threshold-based (SWAN) and optimization-based (MINT) design decisions.}
 \label{tab:v1v2}
 \begin{tabular}{p{3cm}p{4.5cm}p{4.5cm}}
 \toprule
-Aspect & Threshold-based (v1) & MINT (MCKP) \\
+Aspect & Threshold-based (SWAN) & MINT (MCKP) \\
 \midrule
 Objective & Weighted sum + thresholds & Constrained optimization (Eq.~\ref{eq:objective}) \\
 Error metric & Single-point 4-bit NRMSE & Multi-point RD curve (8 configs) \\
