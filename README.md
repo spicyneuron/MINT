@@ -252,4 +252,4 @@ If you use MINT in your research, please cite:
 
 ## License
 
-PolyForm Noncommercial 1.0.0 --- see [LICENSE](LICENSE) for details.
+PolyForm Noncommercial 1.0.0 — see [LICENSE](LICENSE) for details.
