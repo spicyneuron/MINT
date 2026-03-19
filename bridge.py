@@ -28,14 +28,18 @@ def build_module_lookup(manifest: Dict[str, Any]) -> Dict[str, Dict]:
             bits = decision["bits"]
             group_size = decision.get("group_size", 128 if bits == 4 else 64 if bits in (2, 3, 8) else 0)
 
-            # Strip .weight/.bias to get module name
-            if tensor_name.endswith(".weight") or tensor_name.endswith(".bias"):
+            cfg = {"bits": bits, "group_size": group_size}
+            if tensor_name.endswith(".weight"):
                 module_name = tensor_name.rsplit(".", 1)[0]
+                lookup[module_name] = cfg
+                lookup[tensor_name] = cfg
+            elif tensor_name.endswith(".bias"):
+                module_name = tensor_name.rsplit(".", 1)[0]
+                lookup[tensor_name] = cfg
             else:
                 module_name = tensor_name
-
-            lookup[module_name] = {"bits": bits, "group_size": group_size}
-            lookup[tensor_name] = {"bits": bits, "group_size": group_size}
+                lookup[module_name] = cfg
+                lookup[tensor_name] = cfg
 
             # Handle fused gate_up_proj -> separate gate_proj + up_proj
             # BF16 models store fused experts.gate_up_proj but MLX splits
@@ -43,11 +47,11 @@ def build_module_lookup(manifest: Dict[str, Any]) -> Dict[str, Dict]:
             if "gate_up_proj" in module_name:
                 gate_name = module_name.replace("gate_up_proj", "gate_proj")
                 up_name = module_name.replace("gate_up_proj", "up_proj")
-                lookup[gate_name] = {"bits": bits, "group_size": group_size}
-                lookup[up_name] = {"bits": bits, "group_size": group_size}
+                lookup[gate_name] = cfg
+                lookup[up_name] = cfg
                 if tensor_name != module_name:
-                    lookup[tensor_name.replace("gate_up_proj", "gate_proj")] = {"bits": bits, "group_size": group_size}
-                    lookup[tensor_name.replace("gate_up_proj", "up_proj")] = {"bits": bits, "group_size": group_size}
+                    lookup[tensor_name.replace("gate_up_proj", "gate_proj")] = cfg
+                    lookup[tensor_name.replace("gate_up_proj", "up_proj")] = cfg
 
     # Aggregate MoE experts -> SwitchLinear
     from collections import Counter
@@ -139,14 +143,23 @@ def create_knapsack_predicate(manifest: Dict[str, Any]):
 
     # Summary stats
     from collections import Counter
-    bits_counter = Counter()
+    tensor_counter = Counter()
+    param_counter = Counter()
     for shard_data in manifest["shards"].values():
         for tensor_name, info in shard_data["tensors"].items():
-            bits_counter[info["decision"]["bits"]] += 1
-    total = sum(bits_counter.values())
-    logger.info(f"MINT predicate (source: {source_bits}-bit):")
-    for b in sorted(bits_counter):
-        logger.info(f"  {b:2d}-bit: {bits_counter[b]} tensors ({bits_counter[b]/total*100:.1f}%)")
+            bits = info["decision"]["bits"]
+            tensor_counter[bits] += 1
+            param_counter[bits] += info.get("num_params", 0)
+    total_tensors = sum(tensor_counter.values())
+    total_params = sum(param_counter.values())
+    logger.info(f"MINT predicate (source: {source_bits}-bit)")
+    logger.info("Manifest tensor counts:")
+    for b in sorted(tensor_counter):
+        logger.info(f"  {b:2d}-bit: {tensor_counter[b]} tensors ({tensor_counter[b]/total_tensors*100:.1f}%)")
+    if total_params:
+        logger.info("Manifest parameter counts:")
+        for b in sorted(param_counter):
+            logger.info(f"  {b:2d}-bit: {param_counter[b]:,} params ({param_counter[b]/total_params*100:.1f}%)")
 
     def knapsack_predicate(path: str, module: Any, config: Any = None):
         """MLX quant predicate with per-tensor bits and group_size."""
