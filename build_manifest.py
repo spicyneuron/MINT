@@ -39,7 +39,8 @@ def main():
         config = json.load(f)
 
     model_name = config_path.parent.name
-    total_layers = config.get("num_hidden_layers", 48)
+    text_config = config.get("text_config", {})
+    total_layers = text_config.get("num_hidden_layers", config.get("num_hidden_layers", 48))
 
     # Build shard structure from safetensor files
     shard_files = sorted(model_dir.glob("model-*.safetensors"))
