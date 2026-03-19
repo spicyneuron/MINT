@@ -37,18 +37,20 @@ CONFIGS = [
 ]
 
 
+def as_matrix(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert rank-2+ tensors to a 2D view for groupwise quantization."""
+    if tensor.dim() == 2:
+        return tensor.float()
+    return tensor.reshape(-1, tensor.shape[-1]).float()
+
+
 def compute_nrmse(tensor: torch.Tensor, bits: int, group_size: int) -> float:
     """Compute NRMSE for a given (bits, group_size) config."""
     if tensor.dim() < 2:
         return 0.0
 
-    # Handle 3D+ tensors: MoE expert tensors [num_experts, d_in, d_out] or vision patches
-    if tensor.dim() > 2:
-        t = tensor.reshape(-1, tensor.shape[-1]).float()
-        rows, cols = t.shape
-    else:
-        t = tensor.float()
-        rows, cols = t.shape
+    t = as_matrix(tensor)
+    rows, cols = t.shape
 
     # Pad columns to group_size multiple
     if cols % group_size != 0:
@@ -79,12 +81,12 @@ def compute_sqnr(tensor: torch.Tensor, bits: int, group_size: int) -> float:
     if tensor.dim() < 2:
         return float("inf")
 
-    # Handle 3D MoE expert tensors [num_experts, d_in, d_out]
+    # Packed MoE experts use the lowest per-expert SQNR as the safety bound.
     if tensor.dim() == 3:
         sqnrs = [compute_sqnr(tensor[i], bits, group_size) for i in range(tensor.shape[0])]
-        return min(sqnrs)  # worst-case (lowest SQNR) across experts
+        return min(sqnrs)
 
-    t = tensor.float()
+    t = as_matrix(tensor)
     rows, cols = t.shape
 
     if cols % group_size != 0:
@@ -195,7 +197,7 @@ def main():
 
     elapsed = time.time() - t0
     logger.info(
-        f"Done: {processed} 2D tensors + {skipped} 1D tensors "
+        f"Done: {processed} rank>=2 tensors + {skipped} 1D tensors "
         f"in {elapsed:.1f}s ({elapsed/60:.1f} min)"
     )
 
