@@ -5,7 +5,6 @@ from allocator import build_tensor_specs, estimate_size
 from allocator_frontier import (
     build_objective_tables,
     build_result,
-    estimate_runtime_proxy,
     expand_allocations,
     filter_rd_by_live_modules,
     pareto_prune,
@@ -412,21 +411,11 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertEqual(
             sorted(round(candidate["runtime_proxy_bytes"], 10) for candidate in frontier),
             sorted([
-                round(estimate_runtime_proxy(8 * 16, 4, 64, 0.25), 10),
-                round(estimate_runtime_proxy(8 * 16, 16, 0, 0.25), 10),
+                round(estimate_size(8 * 16, 4, 64) * 0.25, 10),
+                round(estimate_size(8 * 16, 16, 0) * 0.25, 10),
             ]),
         )
         self.assertIn(selected["signature"], {candidate["signature"] for candidate in frontier})
-
-    def test_runtime_proxy_applies_small_group_and_8bit_penalties(self):
-        base = estimate_runtime_proxy(256, 4, 64, 1.0)
-        smaller_groups = estimate_runtime_proxy(256, 4, 32, 1.0)
-        wider_groups = estimate_runtime_proxy(256, 4, 128, 1.0)
-        eight_bit = estimate_runtime_proxy(256, 8, 64, 1.0)
-
-        self.assertGreater(smaller_groups, base)
-        self.assertLess(wider_groups, base)
-        self.assertGreater(eight_bit, estimate_size(256, 8, 64))
 
     def test_knee_selector_picks_fastest_point_under_loss_cap(self):
         frontier = [
@@ -537,10 +526,10 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertNotIn("model.visual.blocks.0.attn.q_proj.weight", result["allocations"])
 
         expected_runtime = (
-            estimate_runtime_proxy(100, 4, 64, 1.0)
-            + estimate_runtime_proxy(200, 4, 64, 1.0)
-            + estimate_runtime_proxy(50, 16, 0, 1.0)
-            + estimate_runtime_proxy(240, 4, 64, 0.5)
+            estimate_size(100, 4, 64)
+            + estimate_size(200, 4, 64)
+            + estimate_size(50, 16, 0)
+            + estimate_size(240, 4, 64) * 0.5
         )
         self.assertAlmostEqual(result["runtime_proxy_bytes"], expected_runtime)
         self.assertLess(result["runtime_proxy_bytes"], result["total_size_bytes"])
@@ -552,11 +541,6 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertEqual(result["solver"], "frontier_dp_2d")
         self.assertEqual(result["selection_axes"], ["total_loss", "runtime_proxy_bytes"])
         self.assertEqual(result["size_role"], "guardrail_tiebreaker")
-        self.assertEqual(result["runtime_proxy_profile"]["base"], "size_bytes")
-        self.assertEqual(result["runtime_proxy_profile"]["group_overhead_bytes_per_group"], 2.0)
-        self.assertEqual(result["runtime_proxy_profile"]["eight_bit_premium"], 0.10)
-        self.assertEqual(result["runtime_proxy_profile"]["nondefault_cfg_premium"], 0.02)
-        self.assertEqual(result["runtime_proxy_profile"]["default_speed_cfg"], [4, 64])
         self.assertIn("runtime_bucket_count", result)
         self.assertIn("runtime_bucket_bytes", result)
         self.assertIn("dp_peak_live_states", result)
