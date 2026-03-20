@@ -29,6 +29,10 @@ _MOE_TOP_K_KEYS = (
     "moe_top_k",
     "num_selected_experts",
 )
+_DEFAULT_SPEED_CFG = (4, 64)
+_GROUP_OVERHEAD_BYTES = 2.0
+_EIGHT_BIT_PREMIUM = 0.10
+_NONDEFAULT_CFG_PREMIUM = 0.02
 
 
 def _config_views(config: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
@@ -186,6 +190,28 @@ def compute_active_factor(
     return min(moe_top_k, float(num_experts)) / float(num_experts)
 
 
+def estimate_runtime_proxy(
+    num_params: int,
+    bits: int,
+    group_size: int,
+    active_factor: float,
+) -> float:
+    """Estimate runtime in byte-equivalent units with small kernel-shape nudges."""
+    size = estimate_size(num_params, bits, group_size)
+    runtime = float(size)
+
+    if group_size > 0:
+        runtime += _GROUP_OVERHEAD_BYTES * int(math.ceil(num_params / group_size))
+
+    if bits == 8:
+        runtime += _EIGHT_BIT_PREMIUM * size
+
+    if bits < 16 and (bits, group_size) != _DEFAULT_SPEED_CFG:
+        runtime += _NONDEFAULT_CFG_PREMIUM * size
+
+    return runtime * active_factor
+
+
 def build_objective_tables(
     tensor_specs: List[Dict[str, Any]],
     expert_members: Dict[str, List[str]],
@@ -202,7 +228,7 @@ def build_objective_tables(
         for bits, group_size in spec["valid_configs"]:
             loss = spec["prior"] * spec["alpha"] * spec["rd_curve"].get((bits, group_size), 0.0)
             size = estimate_size(spec["num_params"], bits, group_size)
-            runtime = size * active_factor
+            runtime = estimate_runtime_proxy(spec["num_params"], bits, group_size, active_factor)
             configs.append({
                 "cfg": (bits, group_size),
                 "loss": loss,
@@ -704,6 +730,13 @@ def build_result(
         "average_bits": selected["average_bits"],
         "selection_axes": ["total_loss", "runtime_proxy_bytes"],
         "size_role": "guardrail_tiebreaker",
+        "runtime_proxy_profile": {
+            "base": "size_bytes",
+            "group_overhead_bytes_per_group": _GROUP_OVERHEAD_BYTES,
+            "eight_bit_premium": _EIGHT_BIT_PREMIUM,
+            "nondefault_cfg_premium": _NONDEFAULT_CFG_PREMIUM,
+            "default_speed_cfg": list(_DEFAULT_SPEED_CFG),
+        },
         "bits_distribution": {
             str(bits): {
                 "params": params,

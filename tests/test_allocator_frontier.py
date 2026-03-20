@@ -4,6 +4,7 @@ from allocator import build_tensor_specs, estimate_size
 from allocator_frontier import (
     build_objective_tables,
     build_result,
+    estimate_runtime_proxy,
     filter_rd_by_live_modules,
     prune_local_configs,
     resolve_moe_top_k,
@@ -210,6 +211,16 @@ class FrontierSearchTests(unittest.TestCase):
         cfgs = {cfg["cfg"]: cfg for cfg in table[0]["configs"]}
         self.assertAlmostEqual(cfgs[(4, 64)]["active_factor"], 0.25)
 
+    def test_runtime_proxy_applies_small_group_and_8bit_penalties(self):
+        base = estimate_runtime_proxy(256, 4, 64, 1.0)
+        smaller_groups = estimate_runtime_proxy(256, 4, 32, 1.0)
+        wider_groups = estimate_runtime_proxy(256, 4, 128, 1.0)
+        eight_bit = estimate_runtime_proxy(256, 8, 64, 1.0)
+
+        self.assertGreater(smaller_groups, base)
+        self.assertLess(wider_groups, base)
+        self.assertGreater(eight_bit, estimate_size(256, 8, 64))
+
     def test_knee_selector_picks_fastest_point_under_loss_cap(self):
         frontier = [
             {
@@ -318,10 +329,10 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertNotIn("model.visual.blocks.0.attn.q_proj.weight", result["allocations"])
 
         expected_runtime = (
-            estimate_size(100, 4, 64)
-            + estimate_size(200, 4, 64)
-            + estimate_size(50, 16, 0)
-            + estimate_size(240, 4, 64) * 0.5
+            estimate_runtime_proxy(100, 4, 64, 1.0)
+            + estimate_runtime_proxy(200, 4, 64, 1.0)
+            + estimate_runtime_proxy(50, 16, 0, 1.0)
+            + estimate_runtime_proxy(240, 4, 64, 0.5)
         )
         self.assertAlmostEqual(result["runtime_proxy_bytes"], expected_runtime)
         self.assertLess(result["runtime_proxy_bytes"], result["total_size_bytes"])
@@ -333,6 +344,8 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertEqual(result["solver"], "frontier_grid_search_2d")
         self.assertEqual(result["selection_axes"], ["total_loss", "runtime_proxy_bytes"])
         self.assertEqual(result["size_role"], "guardrail_tiebreaker")
+        self.assertEqual(result["runtime_proxy_profile"]["group_overhead_bytes_per_group"], 2.0)
+        self.assertEqual(result["runtime_proxy_profile"]["eight_bit_premium"], 0.10)
         self.assertIn("solver_runtime_ms", result)
         self.assertIn("sqnr_floor_db", result)
         self.assertIn("average_bits", result)
