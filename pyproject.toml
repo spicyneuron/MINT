@@ -3,18 +3,42 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mint-frontier"
+name = "mint-scripts"
 version = "0.0.0"
-description = "Minimal UVX entrypoint for the MINT frontier allocator"
+description = "Minimal UVX entrypoints for MINT scripts"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "datasets",
+  "numpy",
   "mlx",
   "mlx-lm",
+  "safetensors",
+  "torch",
 ]
 
 [project.scripts]
-mint-frontier = "allocator_frontier:main"
+allocator = "allocator:main"
+allocator_frontier = "allocator_frontier:main"
+analyze_allocation = "analyze_allocation:main"
+build_manifest = "build_manifest:main"
+compute_rd_curves = "compute_rd_curves:main"
+convert = "convert:main"
+convert_gguf = "convert_gguf:main"
+eval_perplexity = "eval_perplexity:main"
+run_experiment = "run_experiment:main"
 
 [tool.setuptools]
-py-modules = ["allocator_frontier", "allocator", "tensor_aliases"]
+py-modules = [
+  "allocator",
+  "allocator_frontier",
+  "analyze_allocation",
+  "bridge",
+  "build_manifest",
+  "compute_rd_curves",
+  "convert",
+  "convert_gguf",
+  "eval_perplexity",
+  "run_experiment",
+  "tensor_aliases",
+]
