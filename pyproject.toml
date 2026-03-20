@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mint-frontier"
+version = "0.0.0"
+description = "Minimal UVX entrypoint for the MINT frontier allocator"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mlx",
+  "mlx-lm",
+]
+
+[project.scripts]
+mint-frontier = "allocator_frontier:main"
+
+[tool.setuptools]
+py-modules = ["allocator_frontier", "allocator", "tensor_aliases"]
