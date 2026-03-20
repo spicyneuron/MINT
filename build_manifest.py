@@ -32,6 +32,8 @@ def main():
     allocation = json.load(open(args.allocation))
     model_dir = Path(args.model_dir)
     alloc_map = allocation["allocations"]
+    solver = allocation.get("solver") or allocation.get("selection_method") or "allocation"
+    selection_method = allocation.get("selection_method") or allocation.get("solver") or "allocation_selected"
 
     # Read model config
     config_path = model_dir / "config.json"
@@ -67,7 +69,7 @@ def main():
                     tensor_info["decision"] = {
                         "bits": a["bits"],
                         "group_size": a["group_size"],
-                        "reason": allocation.get("selection_method", allocation.get("solver", "allocation_selected")),
+                        "reason": selection_method,
                         "nrmse": a["nrmse"],
                         "prior": a["prior"],
                     }
@@ -92,7 +94,8 @@ def main():
         "model": model_name,
         "config": {
             "source_bits": 16,
-            "optimizer": allocation.get("solver", "knapsack_greedy"),
+            "optimizer": solver,
+            "selection_method": allocation.get("selection_method"),
             "budget_gb": allocation.get("budget_gb", allocation["total_size_gb"]),
             "sqnr_floor_db": allocation["sqnr_floor_db"],
         },
@@ -105,6 +108,7 @@ def main():
             "estimated_size_gb": allocation["total_size_gb"],
             "average_bits": allocation["average_bits"],
             "solver": allocation["solver"],
+            "selection_method": allocation.get("selection_method"),
             "solver_runtime_ms": allocation["solver_runtime_ms"],
             "total_loss": allocation["total_loss"],
         },

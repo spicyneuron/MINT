@@ -342,42 +342,190 @@ def prune_local_configs(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return frontier
 
 
-def generate_weight_pairs(step: float = 0.01) -> Iterable[Tuple[float, float]]:
-    units = int(round(1.0 / step))
-    for q_units in range(units + 1):
-        r_units = units - q_units
-        yield (q_units / units, r_units / units)
-
-
-def select_local_configs(
-    objective_tables: List[Dict[str, Any]],
-    weights: Tuple[float, float],
-) -> Dict[str, Dict[str, Any]]:
-    wq, wr = weights
-    selection = {}
-
-    for table in objective_tables:
-        best = min(
-            table["configs"],
-            key=lambda cfg: (
-                wq * cfg["scaled_loss"] + wr * cfg["scaled_runtime"],
-                cfg["loss"],
-                cfg["runtime"],
-                cfg["size"],
-                cfg["cfg"][0],
-                cfg["cfg"][1],
-            ),
-        )
-        selection[table["name"]] = best
-
-    return selection
-
-
 def selection_signature(selection: Dict[str, Dict[str, Any]]) -> Tuple[Tuple[str, int, int], ...]:
     return tuple(
         (name, cfg["cfg"][0], cfg["cfg"][1])
         for name, cfg in sorted(selection.items())
     )
+
+
+def _state_beats(
+    loss: float,
+    runtime: float,
+    size: int,
+    incumbent: Optional[Dict[str, Any]],
+) -> bool:
+    if incumbent is None:
+        return True
+    return (loss, runtime, size) < (
+        incumbent["loss"],
+        incumbent["runtime"],
+        incumbent["size"],
+    )
+
+
+def _runtime_bucket_idx(
+    candidate_runtime: float,
+    runtime_min_total: float,
+    bucket_width: float,
+    runtime_buckets: int,
+) -> int:
+    if candidate_runtime <= runtime_min_total:
+        return 0
+    return min(
+        runtime_buckets,
+        int((candidate_runtime - runtime_min_total) / bucket_width),
+    )
+
+
+def solve_frontier_dp(
+    tensor_specs: List[Dict[str, Any]],
+    objective_tables: List[Dict[str, Any]],
+    expert_members: Dict[str, List[str]],
+    tensor_meta: Dict[str, Dict[str, Any]],
+    runtime_buckets: int = 1024,
+    runtime_bucket_bytes: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Solve the global quality/speed frontier via runtime-bucket DP."""
+    if runtime_buckets <= 0:
+        raise ValueError("runtime_buckets must be positive")
+    if runtime_bucket_bytes is not None and runtime_bucket_bytes <= 0:
+        raise ValueError("runtime_bucket_bytes must be positive")
+
+    fixed_tables = []
+    variable_tables = []
+    for table in objective_tables:
+        if len(table["configs"]) == 1:
+            fixed_tables.append(table)
+        else:
+            variable_tables.append(table)
+
+    fixed_selection = {}
+    fixed_loss = 0.0
+    fixed_runtime = 0.0
+    fixed_size = 0
+    for table in fixed_tables:
+        cfg = table["configs"][0]
+        fixed_selection[table["name"]] = cfg
+        fixed_loss += cfg["loss"]
+        fixed_runtime += cfg["runtime"]
+        fixed_size += cfg["size"]
+
+    min_runtimes = [min(cfg["runtime"] for cfg in table["configs"]) for table in variable_tables]
+    max_runtimes = [max(cfg["runtime"] for cfg in table["configs"]) for table in variable_tables]
+    runtime_min_total = fixed_runtime + sum(min_runtimes)
+    runtime_max_total = fixed_runtime + sum(max_runtimes)
+    runtime_span = runtime_max_total - runtime_min_total
+    bucket_width = (
+        runtime_bucket_bytes
+        if runtime_bucket_bytes is not None
+        else max(1.0, runtime_span / runtime_buckets)
+    )
+
+    remaining_min_runtimes = [0.0] * (len(variable_tables) + 1)
+    for idx in range(len(variable_tables) - 1, -1, -1):
+        remaining_min_runtimes[idx] = remaining_min_runtimes[idx + 1] + min_runtimes[idx]
+
+    states: List[Dict[str, Any]] = [{
+        "loss": fixed_loss,
+        "runtime": fixed_runtime,
+        "size": fixed_size,
+        "prev_state_id": None,
+        "tensor_idx": -1,
+        "cfg_idx": -1,
+    }]
+    live_state_ids: List[Optional[int]] = [None] * (runtime_buckets + 1)
+    live_state_ids[0] = 0
+    dp_peak_live_states = 1
+
+    for tensor_idx, table in enumerate(variable_tables):
+        next_live_state_ids: List[Optional[int]] = [None] * (runtime_buckets + 1)
+        remaining_min_runtime = remaining_min_runtimes[tensor_idx + 1]
+
+        for state_id in live_state_ids:
+            if state_id is None:
+                continue
+            state = states[state_id]
+
+            for cfg_idx, cfg in enumerate(table["configs"]):
+                loss = state["loss"] + cfg["loss"]
+                runtime = state["runtime"] + cfg["runtime"]
+                size = state["size"] + cfg["size"]
+                candidate_runtime = runtime + remaining_min_runtime
+                bucket_idx = _runtime_bucket_idx(
+                    candidate_runtime,
+                    runtime_min_total,
+                    bucket_width,
+                    runtime_buckets,
+                )
+
+                incumbent_id = next_live_state_ids[bucket_idx]
+                incumbent = None if incumbent_id is None else states[incumbent_id]
+                if not _state_beats(loss, runtime, size, incumbent):
+                    continue
+
+                states.append({
+                    "loss": loss,
+                    "runtime": runtime,
+                    "size": size,
+                    "prev_state_id": state_id,
+                    "tensor_idx": tensor_idx,
+                    "cfg_idx": cfg_idx,
+                })
+                next_live_state_ids[bucket_idx] = len(states) - 1
+
+        live_state_ids = next_live_state_ids
+        dp_peak_live_states = max(
+            dp_peak_live_states,
+            sum(state_id is not None for state_id in live_state_ids),
+        )
+
+    terminal_candidates = {}
+    for state_id in live_state_ids:
+        if state_id is None:
+            continue
+
+        selection = dict(fixed_selection)
+        cursor_id = state_id
+        while cursor_id is not None:
+            state = states[cursor_id]
+            if state["tensor_idx"] >= 0:
+                table = variable_tables[state["tensor_idx"]]
+                selection[table["name"]] = table["configs"][state["cfg_idx"]]
+            cursor_id = state["prev_state_id"]
+
+        signature = selection_signature(selection)
+        if signature in terminal_candidates:
+            continue
+
+        allocations, bits_dist, total_loss, total_size, total_runtime, average_bits = expand_allocations(
+            tensor_specs,
+            selection,
+            expert_members,
+            tensor_meta,
+        )
+        terminal_candidates[signature] = {
+            "signature": signature,
+            "allocations": allocations,
+            "bits_distribution": bits_dist,
+            "total_loss": total_loss,
+            "total_size_bytes": total_size,
+            "runtime_proxy_bytes": total_runtime,
+            "average_bits": average_bits,
+            "num_tensors": len(allocations),
+        }
+
+    frontier = pareto_prune(list(terminal_candidates.values()))
+    if not frontier:
+        raise ValueError("Frontier search produced no candidate allocations")
+
+    return frontier, {
+        "runtime_bucket_count": runtime_buckets + 1,
+        "runtime_bucket_bytes": bucket_width,
+        "dp_peak_live_states": dp_peak_live_states,
+        "num_fixed_tensors": len(fixed_tables),
+        "num_variable_tensors": len(variable_tables),
+    }
 
 
 def expand_allocations(
@@ -670,38 +818,19 @@ def search_frontier(
     expert_members: Dict[str, List[str]],
     tensor_meta: Dict[str, Dict[str, Any]],
     size_guardrail_bytes: Optional[int] = None,
+    runtime_buckets: int = 1024,
+    runtime_bucket_bytes: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-    deduped = {}
-
-    for weights in generate_weight_pairs():
-        selection = select_local_configs(objective_tables, weights)
-        signature = selection_signature(selection)
-        if signature in deduped:
-            continue
-
-        allocations, bits_dist, total_loss, total_size, total_runtime, average_bits = expand_allocations(
-            tensor_specs,
-            selection,
-            expert_members,
-            tensor_meta,
-        )
-        deduped[signature] = {
-            "signature": signature,
-            "weights": weights,
-            "allocations": allocations,
-            "bits_distribution": bits_dist,
-            "total_loss": total_loss,
-            "total_size_bytes": total_size,
-            "runtime_proxy_bytes": total_runtime,
-            "average_bits": average_bits,
-            "num_tensors": len(allocations),
-        }
-
-    frontier = pareto_prune(list(deduped.values()))
-    if not frontier:
-        raise ValueError("Frontier search produced no candidate allocations")
-
+    frontier, solver_meta = solve_frontier_dp(
+        tensor_specs,
+        objective_tables,
+        expert_members,
+        tensor_meta,
+        runtime_buckets=runtime_buckets,
+        runtime_bucket_bytes=runtime_bucket_bytes,
+    )
     selected, selection_meta = select_frontier_candidate(frontier, size_guardrail_bytes=size_guardrail_bytes)
+    selection_meta.update(solver_meta)
     return frontier, selected, selection_meta
 
 
@@ -744,8 +873,13 @@ def build_result(
             }
             for bits, params in sorted(selected["bits_distribution"].items())
         },
-        "solver": "frontier_grid_search_2d",
+        "solver": "frontier_dp_2d",
         "solver_runtime_ms": 0.0,
+        "runtime_bucket_count": selection_meta["runtime_bucket_count"],
+        "runtime_bucket_bytes": selection_meta["runtime_bucket_bytes"],
+        "dp_peak_live_states": selection_meta["dp_peak_live_states"],
+        "num_fixed_tensors": selection_meta["num_fixed_tensors"],
+        "num_variable_tensors": selection_meta["num_variable_tensors"],
         "sqnr_floor_db": SQNR_FLOOR_DB,
         "num_tensors": selected["num_tensors"],
         "frontier_size": len(frontier),
@@ -790,7 +924,15 @@ def main():
         default=None,
         help="Optional size guardrail for final point selection",
     )
+    parser.add_argument(
+        "--runtime-buckets",
+        type=int,
+        default=1024,
+        help="Number of runtime buckets for the DP frontier solver",
+    )
     args = parser.parse_args()
+    if args.runtime_buckets <= 0:
+        parser.error("--runtime-buckets must be positive")
 
     t0 = time.time()
     rd_data = json.load(open(args.rd_curves))
@@ -814,6 +956,7 @@ def main():
         expert_members,
         tensor_meta,
         size_guardrail_bytes=size_guardrail_bytes,
+        runtime_buckets=args.runtime_buckets,
     )
 
     result = build_result(selected, frontier, excluded_reason_counts, selection_meta)
