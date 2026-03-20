@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from tensor_aliases import tensor_aliases
+
 logger = logging.getLogger("mint.bridge")
 
 
@@ -28,26 +30,9 @@ def build_module_lookup(manifest: Dict[str, Any]) -> Dict[str, Dict]:
             bits = decision["bits"]
             group_size = decision.get("group_size", 128 if bits == 4 else 64 if bits in (2, 3, 8) else 0)
 
-            # Strip .weight/.bias to get module name
-            if tensor_name.endswith(".weight") or tensor_name.endswith(".bias"):
-                module_name = tensor_name.rsplit(".", 1)[0]
-            else:
-                module_name = tensor_name
-
-            lookup[module_name] = {"bits": bits, "group_size": group_size}
-            lookup[tensor_name] = {"bits": bits, "group_size": group_size}
-
-            # Handle fused gate_up_proj -> separate gate_proj + up_proj
-            # BF16 models store fused experts.gate_up_proj but MLX splits
-            # them into experts.gate_proj and experts.up_proj during loading
-            if "gate_up_proj" in module_name:
-                gate_name = module_name.replace("gate_up_proj", "gate_proj")
-                up_name = module_name.replace("gate_up_proj", "up_proj")
-                lookup[gate_name] = {"bits": bits, "group_size": group_size}
-                lookup[up_name] = {"bits": bits, "group_size": group_size}
-                if tensor_name != module_name:
-                    lookup[tensor_name.replace("gate_up_proj", "gate_proj")] = {"bits": bits, "group_size": group_size}
-                    lookup[tensor_name.replace("gate_up_proj", "up_proj")] = {"bits": bits, "group_size": group_size}
+            cfg_dict = {"bits": bits, "group_size": group_size}
+            for alias in tensor_aliases(tensor_name):
+                lookup[alias] = cfg_dict
 
     # Aggregate MoE experts -> SwitchLinear
     from collections import Counter
@@ -61,13 +46,6 @@ def build_module_lookup(manifest: Dict[str, Any]) -> Dict[str, Dict]:
             switch_name = f"{prefix}.switch_mlp.{proj}"
             moe_groups.setdefault(switch_name, []).append(cfg)
 
-    # Mixtral-style w1/w2/w3 -> gate_proj/down_proj/up_proj mapping
-    PROJ_ALIASES = {
-        "w1": "gate_proj",
-        "w2": "down_proj",
-        "w3": "up_proj",
-    }
-
     for switch_name, cfgs in moe_groups.items():
         # Mode of bits across experts
         bits_counter = Counter(c["bits"] for c in cfgs)
@@ -76,58 +54,12 @@ def build_module_lookup(manifest: Dict[str, Any]) -> Dict[str, Dict]:
         gs_counter = Counter(c["group_size"] for c in cfgs if c["bits"] == mode_bits)
         mode_gs = gs_counter.most_common(1)[0][0]
         cfg_dict = {"bits": mode_bits, "group_size": mode_gs}
-        lookup[switch_name] = cfg_dict
+        for alias in tensor_aliases(switch_name):
+            lookup[alias] = cfg_dict
         logger.debug(f"MoE aggregate: {switch_name} -> {mode_bits}-bit g{mode_gs}")
-
-        # Add aliases: switch_mlp.w1 -> switch_mlp.gate_proj, etc.
-        for old_name, new_name in PROJ_ALIASES.items():
-            if switch_name.endswith(f".{old_name}"):
-                alias = switch_name[:-len(old_name)] + new_name
-                lookup[alias] = cfg_dict
-                logger.debug(f"  alias: {alias}")
-            elif switch_name.endswith(f".{new_name}"):
-                alias = switch_name[:-len(new_name)] + old_name
-                lookup[alias] = cfg_dict
 
     if moe_groups:
         logger.info(f"Mapped {len(moe_groups)} MoE expert groups to SwitchLinear modules")
-
-    # Handle packed MoE expert tensors (no individual expert index).
-    # Some models store experts as 3D tensors: experts.gate_up_proj [num_experts, d_in, d_out]
-    # MLX loads these as SwitchLinear: switch_mlp.gate_proj, switch_mlp.up_proj
-    packed_expert_pattern = re.compile(r"(.+)\.experts\.(gate_up_proj|down_proj)$")
-    packed_count = 0
-    packed_entries = {}
-    for key, cfg in list(lookup.items()):
-        m = packed_expert_pattern.match(key)
-        if m:
-            prefix, proj = m.groups()
-            if proj == "gate_up_proj":
-                packed_entries[f"{prefix}.switch_mlp.gate_proj"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.gate_proj.weight"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.up_proj"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.up_proj.weight"] = cfg
-                packed_count += 2
-            elif proj == "down_proj":
-                packed_entries[f"{prefix}.switch_mlp.down_proj"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.down_proj.weight"] = cfg
-                packed_count += 1
-    if packed_entries:
-        lookup.update(packed_entries)
-        logger.info(f"Mapped {packed_count} packed expert tensors to SwitchLinear modules")
-
-    # Handle MLX sanitize remapping: some models remap safetensor keys during load.
-    # E.g., Qwen3.5 MoE: "model.language_model.X" -> "language_model.model.X"
-    # Add remapped variants so the predicate can match either naming convention.
-    remapped = {}
-    for key, cfg in lookup.items():
-        if key.startswith("model.language_model."):
-            alt = "language_model.model." + key[len("model.language_model."):]
-            if alt not in lookup:
-                remapped[alt] = cfg
-    if remapped:
-        lookup.update(remapped)
-        logger.info(f"Added {len(remapped)} MLX-sanitize remapped keys (model.language_model -> language_model.model)")
 
     return lookup
 
@@ -168,14 +100,6 @@ def create_knapsack_predicate(manifest: Dict[str, Any]):
         if name_lower.endswith("router") or name_lower.endswith("gate"):
             return False
         if re.search(r"model\.norm$", name):
-            return False
-
-        # Vision components
-        vision_patterns = [
-            "vision_model", "visual_encoder", "vision_encoder",
-            "multi_modal_projector", "aligner", "image_newline",
-        ]
-        if any(p in name_lower for p in vision_patterns):
             return False
 
         # Look up MINT decision — try multiple naming conventions
