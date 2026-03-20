@@ -16,13 +16,41 @@ import json
 import logging
 from pathlib import Path
 
-from safetensors import safe_open
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mint.build_manifest")
 
 
+def build_manifest_doc(allocation: dict, model_name: str, total_layers: int, shards: dict) -> dict:
+    """Assemble the manifest document from allocation data and shard metadata."""
+    return {
+        "model": model_name,
+        "config": {
+            "source_bits": 16,
+            "optimizer": "knapsack_greedy",
+            "budget_gb": allocation["budget_gb"],
+            "sqnr_floor_db": allocation["sqnr_floor_db"],
+            "speed_bias": allocation.get("speed_bias", 0.0),
+            "objective": allocation.get("objective", "size_only"),
+        },
+        "total_layers": total_layers,
+        "total_tensors": sum(len(s["tensors"]) for s in shards.values()),
+        "shards": shards,
+        "summary": {
+            "total_params": allocation["total_params"],
+            "bits_distribution": allocation["bits_distribution"],
+            "estimated_size_gb": allocation["total_size_gb"],
+            "runtime_proxy_gb": allocation.get("runtime_proxy_gb"),
+            "average_bits": allocation["average_bits"],
+            "solver": allocation["solver"],
+            "solver_runtime_ms": allocation["solver_runtime_ms"],
+            "total_loss": allocation["total_loss"],
+        },
+    }
+
+
 def main():
+    from safetensors import safe_open
+
     parser = argparse.ArgumentParser(description="Build manifest from allocation + model dir")
     parser.add_argument("--allocation", required=True, help="Allocation JSON from allocator.py")
     parser.add_argument("--model-dir", required=True, help="Path to BF16 model directory")
@@ -88,27 +116,7 @@ def main():
             "tensors": tensors,
         }
 
-    manifest = {
-        "model": model_name,
-        "config": {
-            "source_bits": 16,
-            "optimizer": "knapsack_greedy",
-            "budget_gb": allocation["budget_gb"],
-            "sqnr_floor_db": allocation["sqnr_floor_db"],
-        },
-        "total_layers": total_layers,
-        "total_tensors": sum(len(s["tensors"]) for s in shards.values()),
-        "shards": shards,
-        "summary": {
-            "total_params": allocation["total_params"],
-            "bits_distribution": allocation["bits_distribution"],
-            "estimated_size_gb": allocation["total_size_gb"],
-            "average_bits": allocation["average_bits"],
-            "solver": allocation["solver"],
-            "solver_runtime_ms": allocation["solver_runtime_ms"],
-            "total_loss": allocation["total_loss"],
-        },
-    }
+    manifest = build_manifest_doc(allocation, model_name, total_layers, shards)
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w") as f:

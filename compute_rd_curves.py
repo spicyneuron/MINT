@@ -10,6 +10,8 @@ Usage:
         --output results/model-rd-curves.json
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -18,8 +20,15 @@ import re
 import time
 from pathlib import Path
 
-import torch
-from safetensors import safe_open
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+
+try:
+    from safetensors import safe_open
+except ModuleNotFoundError:
+    safe_open = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mint.rd_curves")
@@ -115,7 +124,18 @@ def extract_layer_idx(name: str):
     return int(m.group(1)) if m else None
 
 
+def extract_num_experts_per_tok(config: dict):
+    """Read num_experts_per_tok from config.json if present."""
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and text_config.get("num_experts_per_tok") is not None:
+        return text_config.get("num_experts_per_tok")
+    return config.get("num_experts_per_tok")
+
+
 def main():
+    if torch is None or safe_open is None:
+        raise ModuleNotFoundError("compute_rd_curves.py requires torch and safetensors")
+
     parser = argparse.ArgumentParser(description="Compute rate-distortion curves")
     parser.add_argument("--model-dir", required=True, help="Path to BF16 model directory")
     parser.add_argument("--output", required=True, help="Output JSON path")
@@ -202,6 +222,9 @@ def main():
     output = {
         "model": model_name,
         "total_layers": total_layers,
+        "model_config": {
+            "num_experts_per_tok": extract_num_experts_per_tok(config),
+        },
         "configs": [list(c) for c in CONFIGS],
         "num_2d_tensors": processed,
         "num_1d_tensors": skipped,
