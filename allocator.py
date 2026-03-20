@@ -40,9 +40,9 @@ DEFAULT_PRIORS = {
 
 # Valid quantization configs to consider
 VALID_CONFIGS = [
-    (2, 32), (2, 64),
+    (2, 64),
     (3, 64),
-    (4, 32), (4, 64), (4, 128),
+    (4, 64), (4, 128),
     (8, 64), (8, 128),
     (16, 0),
 ]

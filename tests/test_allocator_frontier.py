@@ -106,24 +106,24 @@ class FrontierSearchTests(unittest.TestCase):
             "tensors": {
                 "model.layers.0.self_attn.q_proj.weight": rd_tensor(
                     100,
-                    {"2_32": 0.4, "4_64": 0.1},
+                    {"2_64": 0.4, "4_64": 0.1},
                 ),
                 "model.layers.0.mlp.up_proj.weight": rd_tensor(
                     200,
-                    {"2_32": 0.3, "4_64": 0.12},
+                    {"2_64": 0.3, "4_64": 0.12},
                 ),
                 "model.layers.0.input_layernorm.weight": rd_tensor(50, is_1d=True),
                 "model.layers.1.mlp.experts.0.down_proj.weight": rd_tensor(
                     120,
-                    {"2_32": 0.6, "4_64": 0.2},
+                    {"2_64": 0.6, "4_64": 0.2},
                 ),
                 "model.layers.1.mlp.experts.1.down_proj.weight": rd_tensor(
                     120,
-                    {"2_32": 0.6, "4_64": 0.2},
+                    {"2_64": 0.6, "4_64": 0.2},
                 ),
                 "model.visual.blocks.0.attn.q_proj.weight": rd_tensor(
                     300,
-                    {"2_32": 0.5, "4_64": 0.2},
+                    {"2_64": 0.5, "4_64": 0.2},
                 ),
             },
         }
@@ -499,7 +499,7 @@ class FrontierSearchTests(unittest.TestCase):
 
         q_proj_table = next(table for table in objective_tables if table["name"] == "model.layers.0.self_attn.q_proj.weight")
         q_proj_cfgs = {cfg["cfg"]: cfg for cfg in q_proj_table["configs"]}
-        self.assertAlmostEqual(q_proj_cfgs[(2, 32)]["norm_loss"], 1.0)
+        self.assertAlmostEqual(q_proj_cfgs[(2, 64)]["norm_loss"], 1.0)
         self.assertAlmostEqual(q_proj_cfgs[(16, 0)]["norm_size"], 1.0)
         self.assertGreater(q_proj_cfgs[(4, 64)]["norm_loss"], 0.0)
         self.assertLess(q_proj_cfgs[(4, 64)]["norm_loss"], 1.0)

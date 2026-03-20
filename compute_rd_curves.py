@@ -26,10 +26,8 @@ logger = logging.getLogger("mint.rd_curves")
 
 # Configs to evaluate: (bits, group_size)
 CONFIGS = [
-    (2, 32),
     (2, 64),
     (3, 64),
-    (4, 32),
     (4, 64),
     (4, 128),
     (8, 64),
