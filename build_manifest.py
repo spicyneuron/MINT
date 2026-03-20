@@ -67,7 +67,7 @@ def main():
                     tensor_info["decision"] = {
                         "bits": a["bits"],
                         "group_size": a["group_size"],
-                        "reason": "knapsack_optimal",
+                        "reason": allocation.get("selection_method", allocation.get("solver", "allocation_selected")),
                         "nrmse": a["nrmse"],
                         "prior": a["prior"],
                     }
@@ -92,8 +92,8 @@ def main():
         "model": model_name,
         "config": {
             "source_bits": 16,
-            "optimizer": "knapsack_greedy",
-            "budget_gb": allocation["budget_gb"],
+            "optimizer": allocation.get("solver", "knapsack_greedy"),
+            "budget_gb": allocation.get("budget_gb", allocation["total_size_gb"]),
             "sqnr_floor_db": allocation["sqnr_floor_db"],
         },
         "total_layers": total_layers,

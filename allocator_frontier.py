@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("mint.allocator_frontier")
 
 _GB = 1024 ** 3
-_PACKED_EXPERT_PATTERN = re.compile(r".+\.experts\.(gate_up_proj|down_proj)$")
+_PACKED_EXPERT_PATTERN = re.compile(r".+\.experts\.(gate_up_proj|down_proj)(?:\.(?:weight|bias))?$")
 _GROUPED_EXPERT_PATTERN = re.compile(r".+\.experts\.\*\..+")
 _MOE_TOP_K_KEYS = (
     "num_experts_per_tok",
@@ -210,6 +210,7 @@ def build_objective_tables(
                 "runtime": runtime,
             })
 
+        configs = prune_local_configs(configs)
         losses = [cfg["loss"] for cfg in configs]
         sizes = [cfg["size"] for cfg in configs]
         runtimes = [cfg["runtime"] for cfg in configs]
@@ -255,29 +256,88 @@ def build_objective_tables(
     return tables
 
 
-def generate_weight_triples(step: float = 0.05) -> Iterable[Tuple[float, float, float]]:
+def prune_local_configs(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop per-tensor configs that are worse in both quality and runtime.
+
+    Size is not a primary optimization axis, but we keep the minimum-size
+    config as a guardrail anchor so extremely compact options remain reachable.
+    """
+    if len(configs) <= 1:
+        return configs
+
+    min_size_cfg = min(
+        configs,
+        key=lambda cfg: (
+            cfg["size"],
+            cfg["runtime"],
+            cfg["loss"],
+            cfg["cfg"][0],
+            cfg["cfg"][1],
+        ),
+    )
+
+    frontier = []
+    for candidate in configs:
+        dominated = False
+        for other in configs:
+            if other is candidate:
+                continue
+            no_worse = (
+                other["loss"] <= candidate["loss"]
+                and other["runtime"] <= candidate["runtime"]
+            )
+            strictly_better = (
+                other["loss"] < candidate["loss"]
+                or other["runtime"] < candidate["runtime"]
+            )
+            smaller_tie = (
+                other["loss"] == candidate["loss"]
+                and other["runtime"] == candidate["runtime"]
+                and other["size"] < candidate["size"]
+            )
+            if no_worse and (strictly_better or smaller_tie):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(candidate)
+
+    if min_size_cfg not in frontier:
+        frontier.append(min_size_cfg)
+
+    frontier.sort(
+        key=lambda cfg: (
+            cfg["runtime"],
+            cfg["loss"],
+            cfg["size"],
+            cfg["cfg"][0],
+            cfg["cfg"][1],
+        )
+    )
+    return frontier
+
+
+def generate_weight_pairs(step: float = 0.01) -> Iterable[Tuple[float, float]]:
     units = int(round(1.0 / step))
     for q_units in range(units + 1):
-        for m_units in range(units - q_units + 1):
-            s_units = units - q_units - m_units
-            yield (q_units / units, m_units / units, s_units / units)
+        r_units = units - q_units
+        yield (q_units / units, r_units / units)
 
 
 def select_local_configs(
     objective_tables: List[Dict[str, Any]],
-    weights: Tuple[float, float, float],
+    weights: Tuple[float, float],
 ) -> Dict[str, Dict[str, Any]]:
-    wq, wm, ws = weights
+    wq, wr = weights
     selection = {}
 
     for table in objective_tables:
         best = min(
             table["configs"],
             key=lambda cfg: (
-                wq * cfg["scaled_loss"] + wm * cfg["scaled_size"] + ws * cfg["scaled_runtime"],
+                wq * cfg["scaled_loss"] + wr * cfg["scaled_runtime"],
+                cfg["loss"],
                 cfg["runtime"],
                 cfg["size"],
-                cfg["loss"],
                 cfg["cfg"][0],
                 cfg["cfg"][1],
             ),
@@ -362,6 +422,23 @@ def frontier_summary(candidate: Dict[str, Any], selected_signature: Tuple[Tuple[
 
 
 def pareto_prune(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped = {}
+    for candidate in candidates:
+        key = (
+            candidate["total_loss"],
+            candidate["runtime_proxy_bytes"],
+        )
+        existing = deduped.get(key)
+        if existing is None or (
+            candidate["total_size_bytes"],
+            candidate["signature"],
+        ) < (
+            existing["total_size_bytes"],
+            existing["signature"],
+        ):
+            deduped[key] = candidate
+
+    candidates = list(deduped.values())
     frontier = []
     for candidate in candidates:
         dominated = False
@@ -370,15 +447,18 @@ def pareto_prune(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 continue
             no_worse = (
                 other["total_loss"] <= candidate["total_loss"]
-                and other["total_size_bytes"] <= candidate["total_size_bytes"]
                 and other["runtime_proxy_bytes"] <= candidate["runtime_proxy_bytes"]
             )
             strictly_better = (
                 other["total_loss"] < candidate["total_loss"]
-                or other["total_size_bytes"] < candidate["total_size_bytes"]
                 or other["runtime_proxy_bytes"] < candidate["runtime_proxy_bytes"]
             )
-            if no_worse and strictly_better:
+            smaller_tie = (
+                other["total_loss"] == candidate["total_loss"]
+                and other["runtime_proxy_bytes"] == candidate["runtime_proxy_bytes"]
+                and other["total_size_bytes"] < candidate["total_size_bytes"]
+            )
+            if no_worse and (strictly_better or smaller_tie):
                 dominated = True
                 break
         if not dominated:
@@ -386,9 +466,9 @@ def pareto_prune(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     frontier.sort(
         key=lambda candidate: (
-            candidate["total_size_bytes"],
             candidate["runtime_proxy_bytes"],
             candidate["total_loss"],
+            candidate["total_size_bytes"],
         )
     )
     return frontier
@@ -397,18 +477,16 @@ def pareto_prune(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def choose_closest_to_ideal(frontier: List[Dict[str, Any]]) -> Dict[str, Any]:
     mins = {
         "total_loss": min(candidate["total_loss"] for candidate in frontier),
-        "total_size_bytes": min(candidate["total_size_bytes"] for candidate in frontier),
         "runtime_proxy_bytes": min(candidate["runtime_proxy_bytes"] for candidate in frontier),
     }
     maxs = {
         "total_loss": max(candidate["total_loss"] for candidate in frontier),
-        "total_size_bytes": max(candidate["total_size_bytes"] for candidate in frontier),
         "runtime_proxy_bytes": max(candidate["runtime_proxy_bytes"] for candidate in frontier),
     }
 
     def distance(candidate: Dict[str, Any]) -> float:
         total = 0.0
-        for key in ("total_loss", "total_size_bytes", "runtime_proxy_bytes"):
+        for key in ("total_loss", "runtime_proxy_bytes"):
             span = maxs[key] - mins[key]
             if span == 0:
                 continue
@@ -427,7 +505,7 @@ def choose_closest_to_ideal(frontier: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def build_loss_runtime_curve(frontier: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Project the 3D frontier onto the 2D loss/runtime tradeoff curve."""
+    """Project the candidate set onto the loss/runtime tradeoff curve."""
     ordered = sorted(
         frontier,
         key=lambda candidate: (
@@ -494,21 +572,49 @@ def choose_knee_point(curve: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return best
 
 
-def select_frontier_candidate(frontier: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Pick the recommended point using a knee-derived loss cap."""
-    curve = build_loss_runtime_curve(frontier)
+def select_frontier_candidate(
+    frontier: List[Dict[str, Any]],
+    size_guardrail_bytes: Optional[int] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Pick the recommended point from the quality/runtime frontier."""
+    scoped_frontier = frontier
+    if size_guardrail_bytes is not None:
+        scoped_frontier = [
+            candidate for candidate in frontier
+            if candidate["total_size_bytes"] <= size_guardrail_bytes
+        ]
+        if not scoped_frontier:
+            selected = min(
+                frontier,
+                key=lambda candidate: (
+                    candidate["total_size_bytes"],
+                    candidate["runtime_proxy_bytes"],
+                    candidate["total_loss"],
+                ),
+            )
+            return selected, {
+                "selection_method": "size_guardrail_smallest_fallback",
+                "selection_curve_size": 1,
+                "size_guardrail_bytes": size_guardrail_bytes,
+            }
+
+    curve = build_loss_runtime_curve(scoped_frontier)
     knee_point = choose_knee_point(curve)
 
     if knee_point is None:
-        selected = choose_closest_to_ideal(frontier)
+        selected = choose_closest_to_ideal(scoped_frontier)
         return selected, {
             "selection_method": "closest_to_ideal_fallback",
             "selection_curve_size": len(curve),
+            **(
+                {"size_guardrail_bytes": size_guardrail_bytes}
+                if size_guardrail_bytes is not None else {}
+            ),
         }
 
     loss_cap = knee_point["candidate"]["total_loss"]
     eligible = [
-        candidate for candidate in frontier
+        candidate for candidate in scoped_frontier
         if candidate["total_loss"] <= loss_cap + 1e-12
     ]
     selected = min(
@@ -525,6 +631,10 @@ def select_frontier_candidate(frontier: List[Dict[str, Any]]) -> Tuple[Dict[str,
         "loss_cap": loss_cap,
         "knee_point_signature": knee_point["candidate"]["signature"],
         "knee_point_distance": knee_point["distance"],
+        **(
+            {"size_guardrail_bytes": size_guardrail_bytes}
+            if size_guardrail_bytes is not None else {}
+        ),
     }
 
 
@@ -533,10 +643,11 @@ def search_frontier(
     objective_tables: List[Dict[str, Any]],
     expert_members: Dict[str, List[str]],
     tensor_meta: Dict[str, Dict[str, Any]],
+    size_guardrail_bytes: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     deduped = {}
 
-    for weights in generate_weight_triples():
+    for weights in generate_weight_pairs():
         selection = select_local_configs(objective_tables, weights)
         signature = selection_signature(selection)
         if signature in deduped:
@@ -564,7 +675,7 @@ def search_frontier(
     if not frontier:
         raise ValueError("Frontier search produced no candidate allocations")
 
-    selected, selection_meta = select_frontier_candidate(frontier)
+    selected, selection_meta = select_frontier_candidate(frontier, size_guardrail_bytes=size_guardrail_bytes)
     return frontier, selected, selection_meta
 
 
@@ -579,7 +690,7 @@ def build_result(
     excluded_tensor_count = sum(excluded_reason_counts.values())
 
     return {
-        "objective": "pareto_balanced",
+        "objective": "quality_speed_frontier",
         "selection_method": selection_meta["selection_method"],
         "budget_bytes": selected["total_size_bytes"],
         "budget_gb": selected["total_size_bytes"] / _GB,
@@ -591,6 +702,8 @@ def build_result(
         "total_loss": selected["total_loss"],
         "total_params": total_params,
         "average_bits": selected["average_bits"],
+        "selection_axes": ["total_loss", "runtime_proxy_bytes"],
+        "size_role": "guardrail_tiebreaker",
         "bits_distribution": {
             str(bits): {
                 "params": params,
@@ -598,7 +711,7 @@ def build_result(
             }
             for bits, params in sorted(selected["bits_distribution"].items())
         },
-        "solver": "frontier_grid_search",
+        "solver": "frontier_grid_search_2d",
         "solver_runtime_ms": 0.0,
         "sqnr_floor_db": SQNR_FLOOR_DB,
         "num_tensors": selected["num_tensors"],
@@ -622,6 +735,13 @@ def build_result(
             {"selection_knee_point_distance": selection_meta["knee_point_distance"]}
             if "knee_point_distance" in selection_meta else {}
         ),
+        **(
+            {
+                "size_guardrail_bytes": selection_meta["size_guardrail_bytes"],
+                "size_guardrail_gb": selection_meta["size_guardrail_bytes"] / _GB,
+            }
+            if "size_guardrail_bytes" in selection_meta else {}
+        ),
         "allocations": selected["allocations"],
     }
 
@@ -631,6 +751,12 @@ def main():
     parser.add_argument("--rd-curves", required=True, help="RD curves JSON from compute_rd_curves.py")
     parser.add_argument("--model-dir", required=True, help="Path to BF16 model directory")
     parser.add_argument("--output", required=True, help="Output allocation JSON")
+    parser.add_argument(
+        "--max-size-gb",
+        type=float,
+        default=None,
+        help="Optional size guardrail for final point selection",
+    )
     args = parser.parse_args()
 
     t0 = time.time()
@@ -648,11 +774,13 @@ def main():
     tensor_meta = filtered_rd["tensors"]
     moe_top_k = resolve_moe_top_k(config, tensor_specs)
     objective_tables = build_objective_tables(tensor_specs, expert_members, tensor_meta, moe_top_k)
+    size_guardrail_bytes = None if args.max_size_gb is None else int(args.max_size_gb * _GB)
     frontier, selected, selection_meta = search_frontier(
         tensor_specs,
         objective_tables,
         expert_members,
         tensor_meta,
+        size_guardrail_bytes=size_guardrail_bytes,
     )
 
     result = build_result(selected, frontier, excluded_reason_counts, selection_meta)

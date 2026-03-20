@@ -5,6 +5,7 @@ from allocator_frontier import (
     build_objective_tables,
     build_result,
     filter_rd_by_live_modules,
+    prune_local_configs,
     resolve_moe_top_k,
     select_frontier_candidate,
     select_local_configs,
@@ -160,9 +161,54 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertAlmostEqual(dense_table["size_scale"], expert_table["size_scale"])
         self.assertGreater(dense_table["runtime_scale"], expert_table["runtime_scale"])
 
-        selection = select_local_configs(objective_tables, (0.4, 0.0, 0.6))
+        selection = select_local_configs(objective_tables, (0.4, 0.6))
         self.assertEqual(selection[dense_table["name"]]["cfg"], (4, 64))
         self.assertEqual(selection[expert_table["name"]]["cfg"], (16, 0))
+
+    def test_local_prune_keeps_fast_frontier_and_smallest_anchor(self):
+        configs = [
+            {"cfg": (2, 32), "loss": 0.6, "runtime": 10.0, "size": 10},
+            {"cfg": (4, 64), "loss": 0.4, "runtime": 8.0, "size": 12},
+            {"cfg": (8, 64), "loss": 0.2, "runtime": 6.0, "size": 18},
+            {"cfg": (3, 64), "loss": 0.8, "runtime": 12.0, "size": 6},
+        ]
+
+        pruned = prune_local_configs(configs)
+
+        self.assertEqual({cfg["cfg"] for cfg in pruned}, {(8, 64), (3, 64)})
+
+    def test_packed_expert_weight_resolves_top_k_and_active_factor(self):
+        specs = [
+            {
+                "name": "model.layers.1.mlp.experts.gate_up_proj.weight",
+            }
+        ]
+        moe_top_k = resolve_moe_top_k({"text_config": {"num_experts_per_tok": 2}}, specs)
+        self.assertEqual(moe_top_k, 2.0)
+
+        table = build_objective_tables(
+            [
+                {
+                    "name": "model.layers.1.mlp.experts.gate_up_proj.weight",
+                    "num_params": 8 * 16,
+                    "valid_configs": [(4, 64), (16, 0)],
+                    "rd_curve": {(4, 64): 0.25, (16, 0): 0.0},
+                    "prior": 1.0,
+                    "alpha": 1.0,
+                    "layer_idx": 1,
+                }
+            ],
+            {},
+            {
+                "model.layers.1.mlp.experts.gate_up_proj.weight": {
+                    "shape": [8, 4, 4],
+                    "num_params": 8 * 16,
+                }
+            },
+            moe_top_k,
+        )
+        cfgs = {cfg["cfg"]: cfg for cfg in table[0]["configs"]}
+        self.assertAlmostEqual(cfgs[(4, 64)]["active_factor"], 0.25)
 
     def test_knee_selector_picks_fastest_point_under_loss_cap(self):
         frontier = [
@@ -204,6 +250,33 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertEqual(selection_meta["loss_cap"], 4.0)
         self.assertEqual(selected["signature"], (("c", 4, 32),))
 
+    def test_size_guardrail_filters_final_selection(self):
+        frontier = [
+            {
+                "signature": (("fast", 4, 32),),
+                "total_loss": 5.0,
+                "total_size_bytes": 220.0,
+                "runtime_proxy_bytes": 120.0,
+            },
+            {
+                "signature": (("guardrail", 4, 32),),
+                "total_loss": 5.2,
+                "total_size_bytes": 180.0,
+                "runtime_proxy_bytes": 150.0,
+            },
+            {
+                "signature": (("small", 4, 32),),
+                "total_loss": 7.0,
+                "total_size_bytes": 100.0,
+                "runtime_proxy_bytes": 210.0,
+            },
+        ]
+
+        selected, selection_meta = select_frontier_candidate(frontier, size_guardrail_bytes=190.0)
+
+        self.assertEqual(selection_meta["size_guardrail_bytes"], 190.0)
+        self.assertEqual(selected["signature"], (("guardrail", 4, 32),))
+
     def test_frontier_search_selects_balanced_point(self):
         rd_data = self.make_rd_data()
         live_modules = {
@@ -229,7 +302,6 @@ class FrontierSearchTests(unittest.TestCase):
         result = build_result(selected, frontier, reason_counts, selection_meta)
 
         self.assertGreater(len(frontier), 1)
-        self.assertEqual(result["objective"], "pareto_balanced")
         self.assertEqual(result["selection_method"], "knee_loss_cap_fastest_under_cap")
         self.assertEqual(result["frontier_size"], len(frontier))
         self.assertEqual(result["excluded_tensor_count"], 1)
@@ -257,7 +329,10 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertEqual(result["budget_bytes"], result["total_size_bytes"])
         self.assertEqual(result["budget_gb"], result["total_size_gb"])
         self.assertEqual(result["budget_utilization"], 1.0)
-        self.assertIn("solver", result)
+        self.assertEqual(result["objective"], "quality_speed_frontier")
+        self.assertEqual(result["solver"], "frontier_grid_search_2d")
+        self.assertEqual(result["selection_axes"], ["total_loss", "runtime_proxy_bytes"])
+        self.assertEqual(result["size_role"], "guardrail_tiebreaker")
         self.assertIn("solver_runtime_ms", result)
         self.assertIn("sqnr_floor_db", result)
         self.assertIn("average_bits", result)
