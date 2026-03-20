@@ -32,7 +32,7 @@
 \maketitle
 
 \begin{abstract}
-We present \textbf{MINT} (\textbf{M}emory-\textbf{I}nformed \textbf{N}-bit \textbf{T}uning), a data-free mixed-precision quantization framework that formulates per-tensor bit-width and group-size allocation as a \emph{budget-constrained optimization problem}. Given a user-specified memory budget, MINT jointly selects the (bit-width, group-size) configuration for each weight tensor by solving a Multiple-Choice Knapsack Problem (MCKP) over per-tensor rate-distortion curves. The framework introduces three key innovations: (1) \textbf{budget-targeted quantization}---users specify an exact memory target (e.g., ``fit in 4\,GB for iPhone'' or ``fit in 24\,GB for RTX 4090'') and MINT produces a near-optimal allocation for that budget, with a fitted prediction curve that estimates output quality \emph{before} running the pipeline; (2) \textbf{joint bit-width and group-size optimization} that treats group size as a first-class allocation variable, revealing that group-size selection provides larger quality gains than bit-width changes; and (3) an \textbf{SQNR safety veto} with an empirically validated 9\,dB threshold that exploits the natural gap between catastrophic 2-bit quantization (SQNR $<$ 9\,dB, PPL triples) and usable 3-bit quantization (SQNR $>$ 10\,dB). We evaluate MINT on seven model families spanning 8B--109B parameters across dense and Mixture-of-Experts architectures. On Qwen3-30B-A3B, MINT achieves +0.6\% perplexity degradation versus BF16 at 19\,GB (33\% of full size) and matches prior heuristic quality at 2.6\% less storage. On Llama-4-Scout (109B MoE), MINT enables hardware-targeted deployment of the same model across memory tiers: PPL 7.703 at 58\,GB for a 64\,GB device versus PPL 7.359 at 163\,GB for a 192\,GB device, both outperforming uniform 4-bit (PPL 7.899). In matched-size comparisons against GPTQ---a calibration-based method---across three MoE families (Qwen3-30B-A3B, Qwen2-57B-A14B, Mixtral-8x7B), MINT consistently outperforms GPTQ despite being entirely data-free: $-1.7\%$, $-0.95\%$, and $-4.6\%$ perplexity respectively at identical model sizes. Scaling experiments across budget levels reveal that quality returns diminish sharply above ${\sim}$5 average bits, and that standard downstream benchmarks (ARC-Challenge, Winogrande) are insensitive to quantization quality differences---spanning only 2.7--3.4 percentage points across the 3-to-8-bit range versus 18--20\% PPL variation. A comprehensive MMLU evaluation on Qwen3.5-35B-A3B (14{,}015 questions, 5 budget levels from 21--72\,GB) confirms this finding at scale: MMLU saturates at ${\sim}$37\,GB (8 average bits) despite continued PPL improvement, establishing perplexity as the appropriate primary metric for quantization evaluation. We also demonstrate that standard mean perplexity can be misleading due to outlier sequences, and recommend reporting median perplexity and tail statistics alongside standard corpus perplexity. The entire pipeline requires no calibration data, no gradient computation, and completes in under 50 minutes on commodity hardware. Code and pre-quantized models are available at \url{https://github.com/baa-ai/MINT}.
+We present \textbf{MINT} (\textbf{M}emory-\textbf{I}nformed \textbf{N}-bit \textbf{T}uning), a data-free mixed-precision quantization framework that formulates per-tensor bit-width and group-size allocation as a \emph{budget-constrained optimization problem}. Given a user-specified memory budget, MINT jointly selects the (bit-width, group-size) configuration for each weight tensor by solving a Multiple-Choice Knapsack Problem (MCKP) over per-tensor rate-distortion curves. The framework introduces three key innovations: (1) \textbf{budget-targeted quantization}---users specify an exact memory target (e.g., ``fit in 4\,GB for iPhone'' or ``fit in 24\,GB for RTX 4090'') and MINT produces a near-optimal allocation for that budget, with a fitted prediction curve that estimates output quality \emph{before} running the pipeline; (2) \textbf{joint bit-width and group-size optimization} that treats group size as a first-class allocation variable, revealing that group-size selection provides larger quality gains than bit-width changes; and (3) an \textbf{SQNR safety veto} with an empirically validated 9\,dB threshold that exploits the natural gap between catastrophic 2-bit quantization (SQNR $<$ 9\,dB, PPL triples) and usable 3-bit quantization (SQNR $>$ 10\,dB). We evaluate MINT on seven model families spanning 8B--109B parameters across dense and Mixture-of-Experts architectures. On Qwen3-30B-A3B, MINT achieves +0.6\% perplexity degradation versus BF16 at 19\,GB (33\% of full size) and matches prior heuristic quality at 2.6\% less storage. On Llama-4-Scout (109B MoE), MINT enables hardware-targeted deployment of the same model across memory tiers: PPL 7.703 at 58\,GB for a 64\,GB device versus PPL 7.359 at 163\,GB for a 192\,GB device, both outperforming uniform 4-bit (PPL 7.899). In matched-size comparisons against GPTQ---a calibration-based method---across three MoE families (Qwen3-30B-A3B, Qwen2-57B-A14B, Mixtral-8x7B), MINT consistently outperforms GPTQ despite being entirely data-free: $-1.7\%$, $-0.95\%$, and $-4.6\%$ perplexity respectively at identical model sizes. Scaling experiments across budget levels reveal that quality returns diminish sharply above ${\sim}$5 average bits, and that standard downstream benchmarks (ARC-Challenge, Winogrande) are insensitive to quantization quality differences---spanning only 2.7--3.4 percentage points across the 3-to-8-bit range versus 18--20\% PPL variation. A comprehensive MMLU evaluation on Qwen3.5-35B-A3B (14{,}015 questions, 5 budget levels from 21--72\,GB) confirms this finding at scale: MMLU saturates at ${\sim}$37\,GB (8 average bits) despite continued PPL improvement, establishing perplexity as the appropriate primary metric for quantization evaluation. We also demonstrate that standard mean perplexity can be misleading due to outlier sequences, and recommend reporting median perplexity and tail statistics alongside standard corpus perplexity. The entire pipeline requires no calibration data, no gradient computation, and completes in under 50 minutes on commodity hardware. Code is available at \url{https://github.com/baa-ai/MINT} and pre-quantized models at \url{https://huggingface.co/baa-ai}.
 \end{abstract}
 
 % ═══════════════════════════════════════════════════════════════════════════════
@@ -700,6 +700,29 @@ The scaling data yields concrete deployment recommendations:
     \item \textbf{MINT's advantage is strongest at ${\sim}$4 bits}: at 8-bit all tensors quantize well and uniform allocation is nearly optimal; at 3-bit all tensors are impaired and allocation has limited room to help. The 4-bit regime is where per-tensor decisions pay off most.
 \end{itemize}
 
+\subsection{Minimum Bit-Width Floor}
+\label{sec:min_bits}
+
+MINT provides a \texttt{--min-bits} parameter (default: 4) controlling the lowest bit-width the allocator may assign. Setting \texttt{--min-bits 2} allows 3-bit allocations wherever the SQNR safety veto permits. We evaluate the impact on GLM-4.7-Flash (30B dense) at a fixed 16\,GB budget (Table~\ref{tab:minbits}).
+
+\begin{table}[h]
+\centering
+\caption{Effect of minimum bit-width floor on GLM-4.7-Flash at 16\,GB budget. \texttt{--min-bits 4} (default) achieves the best median PPL despite slightly larger size. Mean PPL is unreliable on this model due to outlier sequences (BF16 mean 11.5 appears worse than quantized mean 10.2).}
+\label{tab:minbits}
+\begin{tabular}{lrrrrr}
+\toprule
+Config & Size (GB) & Avg bits & PPL (mean) & PPL (median) & $\Delta$ vs BF16 \\
+\midrule
+Uniform 4-bit & 16.9 & 4.0 & 14.749 & 10.076 & +19.0\% \\
+MINT (\texttt{--min-bits 3}) & 15.1 & 4.0 & 10.228 & 9.310 & +9.9\% \\
+\textbf{MINT (\texttt{--min-bits 4})} & \textbf{16.5} & \textbf{4.4} & 12.541 & \textbf{8.723} & \textbf{+3.0\%} \\
+BF16 & 58.0 & 16.0 & 11.516 & 8.470 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The default \texttt{--min-bits 4} produces the best median PPL (8.723, only +3.0\% vs BF16) at 28\% of the full model size. The \texttt{--min-bits 3} variant is 1.4\,GB smaller but 6.7\% worse on median PPL (9.310 vs 8.723). The same pattern holds on Qwen3.5-35B-A3B: \texttt{--min-bits 4} produces better MMLU (70.91\% at 30\,GB) than \texttt{--min-bits 2} (70.22\% at 21\,GB), despite the latter having superior mean PPL. We recommend \texttt{--min-bits 4} as the default; the 3-bit option is available for extreme memory constraints where users are willing to accept the quality tradeoff.
+
 \subsection{Throughput}
 \label{sec:throughput}
 
@@ -758,7 +781,7 @@ Contrary to the conventional assumption that calibration-based methods are stric
 
 \bibliographystyle{plain}
 
-\begin{thebibliography}{20}
+\begin{thebibliography}{99}
 
 \bibitem{frantar2023gptq}
 E.~Frantar, S.~Ashkboos, T.~Hoefler, and D.~Alistarh.
