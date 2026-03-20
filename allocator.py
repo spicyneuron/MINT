@@ -48,6 +48,16 @@ VALID_CONFIGS = [
 ]
 
 
+def is_mlx_export_tensor(tensor_name: str) -> bool:
+    """Return True if the tensor is part of the MLX language-model export path."""
+    return (
+        tensor_name.startswith("model.language_model.")
+        or tensor_name.startswith("language_model.model.")
+        or tensor_name.startswith("lm_head")
+        or tensor_name.startswith("language_model.lm_head")
+    )
+
+
 def estimate_size(num_params: int, bits: int, group_size: int) -> int:
     """Estimate storage size in bytes for a tensor at given (bits, group_size)."""
     if bits >= 16:
@@ -121,8 +131,14 @@ def _group_moe_experts(rd_data: Dict, moe_aggregation: str = "weighted_mean") ->
     moe_pattern = re.compile(r"(.+)\.experts\.(\d+)\.(.+)")
     groups: Dict[str, List[Tuple[str, Dict]]] = {}
     non_expert = {}
+    skipped = 0
+    skipped_params = 0
 
     for name, tdata in rd_data["tensors"].items():
+        if not is_mlx_export_tensor(name):
+            skipped += 1
+            skipped_params += tdata["num_params"]
+            continue
         m = moe_pattern.match(name)
         if m:
             prefix, expert_idx, suffix = m.groups()
@@ -176,6 +192,11 @@ def _group_moe_experts(rd_data: Dict, moe_aggregation: str = "weighted_mean") ->
         num_groups = len(expert_members)
         num_experts = sum(len(v) for v in expert_members.values())
         logger.info(f"Grouped {num_experts} expert tensors into {num_groups} groups")
+    if skipped:
+        logger.info(
+            f"Skipped {skipped} non-export tensors "
+            f"({skipped_params / 1e9:.3f}B params) from allocation scope"
+        )
 
     return grouped_tensors, expert_members
 

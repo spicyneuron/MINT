@@ -22,6 +22,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("mint.build_manifest")
 
 
+def is_mlx_export_tensor(tensor_name: str) -> bool:
+    """Return True if the tensor is part of the MLX language-model export path."""
+    return (
+        tensor_name.startswith("model.language_model.")
+        or tensor_name.startswith("language_model.model.")
+        or tensor_name.startswith("lm_head")
+        or tensor_name.startswith("language_model.lm_head")
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build manifest from allocation + model dir")
     parser.add_argument("--allocation", required=True, help="Allocation JSON from allocator.py")
@@ -47,10 +57,19 @@ def main():
         shard_files = sorted(model_dir.glob("*.safetensors"))
 
     shards = {}
+    skipped = 0
+    skipped_params = 0
     for sf in shard_files:
         tensors = {}
         with safe_open(str(sf), framework="pt") as f:
             for key in f.keys():
+                if not is_mlx_export_tensor(key):
+                    t = f.get_tensor(key)
+                    skipped += 1
+                    skipped_params += t.numel()
+                    del t
+                    continue
+
                 t = f.get_tensor(key)
                 shape = list(t.shape)
                 dtype = str(t.dtype)
@@ -120,6 +139,11 @@ def main():
     logger.info(f"  Estimated size: {allocation['total_size_gb']:.2f} GB")
     logger.info(f"  Avg bits: {allocation['average_bits']:.2f}")
     logger.info(f"  Tensors: {manifest['total_tensors']}")
+    if skipped:
+        logger.info(
+            f"  Skipped non-export tensors: {skipped} "
+            f"({skipped_params / 1e9:.3f}B params)"
+        )
 
 
 if __name__ == "__main__":
