@@ -6,6 +6,8 @@ from allocator_frontier import (
     build_result,
     filter_rd_by_live_modules,
     resolve_moe_top_k,
+    select_frontier_candidate,
+    select_local_configs,
     search_frontier,
 )
 from tensor_aliases import tensor_aliases
@@ -122,6 +124,86 @@ class FrontierSearchTests(unittest.TestCase):
             },
         }
 
+    def test_runtime_scale_survives_local_normalization(self):
+        rd_data = {
+            "model": "synthetic",
+            "total_layers": 1,
+            "num_2d_tensors": 3,
+            "num_1d_tensors": 0,
+            "tensors": {
+                "model.layers.0.self_attn.q_proj.weight": rd_tensor(
+                    120,
+                    {"4_64": 0.25},
+                ),
+                "model.layers.0.mlp.experts.0.down_proj.weight": rd_tensor(
+                    60,
+                    {"4_64": 0.25},
+                ),
+                "model.layers.0.mlp.experts.1.down_proj.weight": rd_tensor(
+                    60,
+                    {"4_64": 0.25},
+                ),
+            },
+        }
+        live_modules = {
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.mlp.switch_mlp.down_proj",
+        }
+        filtered, _, _ = filter_rd_by_live_modules(rd_data, live_modules)
+        specs, expert_members = build_tensor_specs(filtered, filtered["total_layers"])
+        moe_top_k = resolve_moe_top_k({"text_config": {"num_experts_per_tok": 1}}, specs)
+        objective_tables = build_objective_tables(specs, expert_members, filtered["tensors"], moe_top_k)
+
+        dense_table = next(table for table in objective_tables if table["name"] == "model.layers.0.self_attn.q_proj.weight")
+        expert_table = next(table for table in objective_tables if table["name"] == "model.layers.0.mlp.experts.*.down_proj.weight")
+
+        self.assertAlmostEqual(dense_table["size_scale"], expert_table["size_scale"])
+        self.assertGreater(dense_table["runtime_scale"], expert_table["runtime_scale"])
+
+        selection = select_local_configs(objective_tables, (0.4, 0.0, 0.6))
+        self.assertEqual(selection[dense_table["name"]]["cfg"], (4, 64))
+        self.assertEqual(selection[expert_table["name"]]["cfg"], (16, 0))
+
+    def test_knee_selector_picks_fastest_point_under_loss_cap(self):
+        frontier = [
+            {
+                "signature": (("a", 4, 32),),
+                "total_loss": 10.0,
+                "total_size_bytes": 100.0,
+                "runtime_proxy_bytes": 100.0,
+            },
+            {
+                "signature": (("b", 4, 32),),
+                "total_loss": 6.0,
+                "total_size_bytes": 140.0,
+                "runtime_proxy_bytes": 160.0,
+            },
+            {
+                "signature": (("c", 4, 32),),
+                "total_loss": 4.0,
+                "total_size_bytes": 200.0,
+                "runtime_proxy_bytes": 240.0,
+            },
+            {
+                "signature": (("d", 4, 32),),
+                "total_loss": 3.7,
+                "total_size_bytes": 260.0,
+                "runtime_proxy_bytes": 330.0,
+            },
+            {
+                "signature": (("e", 4, 32),),
+                "total_loss": 3.6,
+                "total_size_bytes": 320.0,
+                "runtime_proxy_bytes": 430.0,
+            },
+        ]
+
+        selected, selection_meta = select_frontier_candidate(frontier)
+
+        self.assertEqual(selection_meta["selection_method"], "knee_loss_cap_fastest_under_cap")
+        self.assertEqual(selection_meta["loss_cap"], 4.0)
+        self.assertEqual(selected["signature"], (("c", 4, 32),))
+
     def test_frontier_search_selects_balanced_point(self):
         rd_data = self.make_rd_data()
         live_modules = {
@@ -141,17 +223,20 @@ class FrontierSearchTests(unittest.TestCase):
         self.assertAlmostEqual(q_proj_cfgs[(16, 0)]["norm_size"], 1.0)
         self.assertGreater(q_proj_cfgs[(4, 64)]["norm_loss"], 0.0)
         self.assertLess(q_proj_cfgs[(4, 64)]["norm_loss"], 1.0)
+        self.assertIn("scaled_runtime", q_proj_cfgs[(4, 64)])
 
-        frontier, selected = search_frontier(specs, objective_tables, expert_members, filtered["tensors"])
-        result = build_result(selected, frontier, reason_counts)
+        frontier, selected, selection_meta = search_frontier(specs, objective_tables, expert_members, filtered["tensors"])
+        result = build_result(selected, frontier, reason_counts, selection_meta)
 
         self.assertGreater(len(frontier), 1)
         self.assertEqual(result["objective"], "pareto_balanced")
-        self.assertEqual(result["selection_method"], "closest_to_ideal")
+        self.assertEqual(result["selection_method"], "knee_loss_cap_fastest_under_cap")
         self.assertEqual(result["frontier_size"], len(frontier))
         self.assertEqual(result["excluded_tensor_count"], 1)
         self.assertEqual(result["excluded_reason_counts"]["not_live_in_mlxlm"], 1)
         self.assertEqual(len([point for point in result["frontier"] if point["selected"]]), 1)
+        self.assertIn("selection_loss_cap", result)
+        self.assertIn("selection_curve_size", result)
 
         self.assertEqual(result["allocations"]["model.layers.0.self_attn.q_proj.weight"]["bits"], 4)
         self.assertEqual(result["allocations"]["model.layers.0.mlp.up_proj.weight"]["bits"], 4)

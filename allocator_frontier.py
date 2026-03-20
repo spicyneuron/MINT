@@ -217,6 +217,9 @@ def build_objective_tables(
         loss_min, loss_max = min(losses), max(losses)
         size_min, size_max = min(sizes), max(sizes)
         runtime_min, runtime_max = min(runtimes), max(runtimes)
+        loss_range = loss_max - loss_min
+        size_range = size_max - size_min
+        runtime_range = runtime_max - runtime_min
 
         for cfg in configs:
             cfg["norm_loss"] = 0.0 if loss_max == loss_min else (cfg["loss"] - loss_min) / (loss_max - loss_min)
@@ -227,7 +230,27 @@ def build_objective_tables(
         tables.append({
             "name": spec["name"],
             "configs": configs,
+            "loss_range": loss_range,
+            "size_range": size_range,
+            "runtime_range": runtime_range,
         })
+
+    max_loss_range = max((table["loss_range"] for table in tables), default=0.0)
+    max_size_range = max((table["size_range"] for table in tables), default=0.0)
+    max_runtime_range = max((table["runtime_range"] for table in tables), default=0.0)
+
+    for table in tables:
+        loss_scale = 0.0 if max_loss_range == 0 else table["loss_range"] / max_loss_range
+        size_scale = 0.0 if max_size_range == 0 else table["size_range"] / max_size_range
+        runtime_scale = 0.0 if max_runtime_range == 0 else table["runtime_range"] / max_runtime_range
+        table["loss_scale"] = loss_scale
+        table["size_scale"] = size_scale
+        table["runtime_scale"] = runtime_scale
+
+        for cfg in table["configs"]:
+            cfg["scaled_loss"] = cfg["norm_loss"] * loss_scale
+            cfg["scaled_size"] = cfg["norm_size"] * size_scale
+            cfg["scaled_runtime"] = cfg["norm_runtime"] * runtime_scale
 
     return tables
 
@@ -251,7 +274,7 @@ def select_local_configs(
         best = min(
             table["configs"],
             key=lambda cfg: (
-                wq * cfg["norm_loss"] + wm * cfg["norm_size"] + ws * cfg["norm_runtime"],
+                wq * cfg["scaled_loss"] + wm * cfg["scaled_size"] + ws * cfg["scaled_runtime"],
                 cfg["runtime"],
                 cfg["size"],
                 cfg["loss"],
@@ -403,12 +426,114 @@ def choose_closest_to_ideal(frontier: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
 
+def build_loss_runtime_curve(frontier: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Project the 3D frontier onto the 2D loss/runtime tradeoff curve."""
+    ordered = sorted(
+        frontier,
+        key=lambda candidate: (
+            candidate["runtime_proxy_bytes"],
+            candidate["total_loss"],
+            candidate["total_size_bytes"],
+        ),
+    )
+
+    curve = []
+    best_loss = float("inf")
+    for candidate in ordered:
+        if candidate["total_loss"] < best_loss:
+            curve.append(candidate)
+            best_loss = candidate["total_loss"]
+
+    return curve
+
+
+def choose_knee_point(curve: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Select the knee of the loss/runtime curve via max distance to the chord."""
+    if len(curve) < 3:
+        return None
+
+    runtimes = [candidate["runtime_proxy_bytes"] for candidate in curve]
+    losses = [candidate["total_loss"] for candidate in curve]
+    runtime_min, runtime_max = min(runtimes), max(runtimes)
+    loss_min, loss_max = min(losses), max(losses)
+
+    if runtime_max == runtime_min or loss_max == loss_min:
+        return None
+
+    start = (0.0, 0.0)
+    end = (1.0, 1.0)
+    line_len = math.hypot(end[0] - start[0], end[1] - start[1])
+    if line_len == 0:
+        return None
+
+    best = None
+    for candidate in curve[1:-1]:
+        x = (candidate["runtime_proxy_bytes"] - runtime_min) / (runtime_max - runtime_min)
+        y = (loss_max - candidate["total_loss"]) / (loss_max - loss_min)
+        distance = abs((end[1] - start[1]) * x - (end[0] - start[0]) * y) / line_len
+        point = {
+            "candidate": candidate,
+            "distance": distance,
+        }
+        if best is None or (
+            point["distance"],
+            -candidate["total_loss"],
+            -candidate["runtime_proxy_bytes"],
+            -candidate["total_size_bytes"],
+        ) > (
+            best["distance"],
+            -best["candidate"]["total_loss"],
+            -best["candidate"]["runtime_proxy_bytes"],
+            -best["candidate"]["total_size_bytes"],
+        ):
+            best = point
+
+    if best is None or best["distance"] <= 0:
+        return None
+
+    return best
+
+
+def select_frontier_candidate(frontier: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Pick the recommended point using a knee-derived loss cap."""
+    curve = build_loss_runtime_curve(frontier)
+    knee_point = choose_knee_point(curve)
+
+    if knee_point is None:
+        selected = choose_closest_to_ideal(frontier)
+        return selected, {
+            "selection_method": "closest_to_ideal_fallback",
+            "selection_curve_size": len(curve),
+        }
+
+    loss_cap = knee_point["candidate"]["total_loss"]
+    eligible = [
+        candidate for candidate in frontier
+        if candidate["total_loss"] <= loss_cap + 1e-12
+    ]
+    selected = min(
+        eligible,
+        key=lambda candidate: (
+            candidate["runtime_proxy_bytes"],
+            candidate["total_size_bytes"],
+            candidate["total_loss"],
+        ),
+    )
+    return selected, {
+        "selection_method": "knee_loss_cap_fastest_under_cap",
+        "selection_curve_size": len(curve),
+        "loss_cap": loss_cap,
+        "knee_point_signature": knee_point["candidate"]["signature"],
+        "knee_point_distance": knee_point["distance"],
+    }
+
+
 def search_frontier(
     tensor_specs: List[Dict[str, Any]],
     objective_tables: List[Dict[str, Any]],
     expert_members: Dict[str, List[str]],
     tensor_meta: Dict[str, Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     deduped = {}
 
     for weights in generate_weight_triples():
@@ -439,14 +564,15 @@ def search_frontier(
     if not frontier:
         raise ValueError("Frontier search produced no candidate allocations")
 
-    selected = choose_closest_to_ideal(frontier)
-    return frontier, selected
+    selected, selection_meta = select_frontier_candidate(frontier)
+    return frontier, selected, selection_meta
 
 
 def build_result(
     selected: Dict[str, Any],
     frontier: List[Dict[str, Any]],
     excluded_reason_counts: Dict[str, int],
+    selection_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
     total_params = sum(selected["bits_distribution"].values())
     frontier_points = [frontier_summary(candidate, selected["signature"]) for candidate in frontier]
@@ -454,7 +580,7 @@ def build_result(
 
     return {
         "objective": "pareto_balanced",
-        "selection_method": "closest_to_ideal",
+        "selection_method": selection_meta["selection_method"],
         "budget_bytes": selected["total_size_bytes"],
         "budget_gb": selected["total_size_bytes"] / _GB,
         "budget_utilization": 1.0,
@@ -487,6 +613,15 @@ def build_result(
                 if key != "not_live_in_mlxlm"
             },
         },
+        "selection_curve_size": selection_meta["selection_curve_size"],
+        **(
+            {"selection_loss_cap": selection_meta["loss_cap"]}
+            if "loss_cap" in selection_meta else {}
+        ),
+        **(
+            {"selection_knee_point_distance": selection_meta["knee_point_distance"]}
+            if "knee_point_distance" in selection_meta else {}
+        ),
         "allocations": selected["allocations"],
     }
 
@@ -513,9 +648,14 @@ def main():
     tensor_meta = filtered_rd["tensors"]
     moe_top_k = resolve_moe_top_k(config, tensor_specs)
     objective_tables = build_objective_tables(tensor_specs, expert_members, tensor_meta, moe_top_k)
-    frontier, selected = search_frontier(tensor_specs, objective_tables, expert_members, tensor_meta)
+    frontier, selected, selection_meta = search_frontier(
+        tensor_specs,
+        objective_tables,
+        expert_members,
+        tensor_meta,
+    )
 
-    result = build_result(selected, frontier, excluded_reason_counts)
+    result = build_result(selected, frontier, excluded_reason_counts, selection_meta)
     result["solver_runtime_ms"] = (time.time() - t0) * 1000
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
