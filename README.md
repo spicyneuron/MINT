@@ -187,13 +187,6 @@ The bridge handles both per-expert manifests (e.g., `experts.0.gate_proj`) and p
 
 Models quantized with MINT are available on HuggingFace under [baa-ai](https://huggingface.co/baa-ai):
 
-### GGUF (cross-platform: llama.cpp, ollama, LM Studio)
-
-| Model | Size | HuggingFace |
-|-------|------|-------------|
-| Mixtral-8x7B-Instruct | 26 GB | [baa-ai/Mixtral-8x7B-Instruct-SWAN-4bit-GGUF](https://huggingface.co/baa-ai/Mixtral-8x7B-Instruct-SWAN-4bit-GGUF) |
-| Qwen3-30B-A3B | 16 GB | [baa-ai/Qwen3-30B-A3B-SWAN-4bit-GGUF](https://huggingface.co/baa-ai/Qwen3-30B-A3B-SWAN-4bit-GGUF) |
-
 ### MLX (Apple Silicon)
 
 | Model | Size | HuggingFace |
