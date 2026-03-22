@@ -187,6 +187,14 @@ The bridge handles both per-expert manifests (e.g., `experts.0.gate_proj`) and p
 
 Models quantized with MINT are available on HuggingFace under [baa-ai](https://huggingface.co/baa-ai):
 
+### GGUF (Ollama / llama.cpp / LM Studio — any platform)
+
+| Model | Size | HuggingFace |
+|-------|------|-------------|
+| Llama-3.1-8B Instruct | 4.7 GB | [baa-ai/Llama-3.1-8B-Instruct-MINT-GGUF](https://huggingface.co/baa-ai/Llama-3.1-8B-Instruct-MINT-GGUF) |
+| Qwen3-30B-A3B | 17 GB | [baa-ai/Qwen3-30B-A3B-MINT-GGUF](https://huggingface.co/baa-ai/Qwen3-30B-A3B-MINT-GGUF) |
+| Qwen3.5-35B-A3B | 20 GB | [baa-ai/Qwen3.5-35B-A3B-MINT-GGUF](https://huggingface.co/baa-ai/Qwen3.5-35B-A3B-MINT-GGUF) |
+
 ### MLX (Apple Silicon)
 
 | Model | Size | HuggingFace |
@@ -206,15 +214,33 @@ Models quantized with MINT are available on HuggingFace under [baa-ai](https://h
 | `allocator.py` | Step 2: MCKP budget-constrained solver |
 | `build_manifest.py` | Step 3: Allocation + model metadata -> manifest |
 | `bridge.py` | Manifest -> MLX quant_predicate function |
-| `convert.py` | Step 4: MLX model conversion |
+| `convert.py` | Step 4a: MLX model conversion |
+| `mint_convert.py` | Step 4b: Convert MINT models to GGUF or HF format |
+| `mint_dequantize.py` | Dequantize MLX packed weights to BF16 |
 | `eval_perplexity.py` | Step 5: WikiText-2 perplexity evaluation |
 | `analyze_allocation.py` | Optional: analyze/compare allocations |
 | `run_experiment.py` | Optional: orchestrate convert + eval |
 | `MINT.tex` | Paper source |
 
+## GGUF Conversion
+
+Convert any MINT MLX model to GGUF for use with Ollama, llama.cpp, or LM Studio:
+
+```bash
+# Convert to GGUF (handles MoE expert splitting automatically)
+python mint_convert.py --model /path/to/mint-mlx-model --format gguf --output model.gguf
+
+# Run with Ollama
+ollama create mymodel -f <(echo "FROM ./model.gguf")
+ollama run mymodel
+```
+
+Supports: `--format mlx` (default, validates), `--format gguf` (Ollama/llama.cpp), `--format hf` (standard BF16).
+
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4) for Steps 4-5
+- macOS with Apple Silicon (M1/M2/M3/M4) for Steps 1-4a
+- llama.cpp tools for GGUF conversion (Step 4b): `brew install llama.cpp`
 - Python 3.10+
 - ~2x model size in RAM for Step 1 (loading BF16 weights)
 
