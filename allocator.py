@@ -41,11 +41,34 @@ DEFAULT_PRIORS = {
 # Valid quantization configs to consider
 VALID_CONFIGS = [
     (2, 32), (2, 64),
-    (3, 64),
+    (3, 32), (3, 64),
     (4, 32), (4, 64), (4, 128),
+    (5, 32), (5, 64),
+    (6, 32), (6, 64),
     (8, 64), (8, 128),
     (16, 0),
 ]
+
+# Speed mode presets — controls which bit widths are allowed.
+# MLX Metal kernels have faster dequantization for power-of-2 bit widths (2,4,8).
+# Non-power-of-2 (3,5,6) require irregular packing, with 5-bit being the slowest.
+SPEED_CONFIGS = {
+    "full": VALID_CONFIGS,  # all 14 configs, best PPL
+    "balanced": [            # drop 5-bit (worst dequant overhead), keep 6-bit
+        (2, 32), (2, 64),
+        (3, 32), (3, 64),
+        (4, 32), (4, 64), (4, 128),
+        (6, 32), (6, 64),
+        (8, 64), (8, 128),
+        (16, 0),
+    ],
+    "fast": [                # power-of-2 bits only, fastest dequant
+        (2, 32), (2, 64),
+        (4, 32), (4, 64), (4, 128),
+        (8, 64), (8, 128),
+        (16, 0),
+    ],
+}
 
 
 def estimate_size(num_params: int, bits: int, group_size: int) -> int:
@@ -112,7 +135,7 @@ def _group_moe_experts(rd_data: Dict, moe_aggregation: str = "weighted_mean") ->
         moe_aggregation: How to aggregate NRMSE across experts in a group.
             "weighted_mean" (default): parameter-weighted mean, consistent
                 with the additive global objective.
-            "max": worst-case (maximum) across experts (conservative).
+            "max": worst-case (maximum) across experts (legacy behavior).
 
     Returns:
         grouped_tensors: dict mapping group_name -> merged tensor data
@@ -149,18 +172,25 @@ def _group_moe_experts(rd_data: Dict, moe_aggregation: str = "weighted_mean") ->
                 all_cfg_keys.update(tdata["sqnr"].keys())
 
             for cfg_key in all_cfg_keys:
-                nrmses = [m[1]["rd_curve"].get(cfg_key, 1.0) for m in members if not m[1]["is_1d"]]
-                sqnrs = [m[1]["sqnr"].get(cfg_key, 0.0) for m in members if not m[1]["is_1d"]]
-                if nrmses:
-                    if moe_aggregation == "weighted_mean":
-                        # Parameter-weighted mean: consistent with additive global loss
-                        params = [m[1]["num_params"] for m in members if not m[1]["is_1d"]]
+                expert_data = [(m[1]["rd_curve"].get(cfg_key, 1.0),
+                                m[1]["sqnr"].get(cfg_key, 0.0),
+                                m[1]["num_params"])
+                               for m in members if not m[1]["is_1d"]]
+                if expert_data:
+                    nrmses = [d[0] for d in expert_data]
+                    sqnrs = [d[1] for d in expert_data]
+                    params = [d[2] for d in expert_data]
+
+                    if moe_aggregation == "max":
+                        merged_rd[cfg_key] = max(nrmses)
+                    else:  # weighted_mean
                         total_p = sum(params)
-                        merged_rd[cfg_key] = sum(n * p for n, p in zip(nrmses, params)) / total_p if total_p > 0 else max(nrmses)
-                    else:
-                        merged_rd[cfg_key] = max(nrmses)  # worst-case
-                if sqnrs:
-                    merged_sqnr[cfg_key] = min(sqnrs)  # worst-case
+                        if total_p > 0:
+                            merged_rd[cfg_key] = sum(n * p for n, p in zip(nrmses, params)) / total_p
+                        else:
+                            merged_rd[cfg_key] = max(nrmses)
+
+                    merged_sqnr[cfg_key] = min(sqnrs)  # always worst-case for safety
 
         grouped_tensors[group_key] = {
             "shape": list(members[0][1]["shape"]),
@@ -175,7 +205,8 @@ def _group_moe_experts(rd_data: Dict, moe_aggregation: str = "weighted_mean") ->
     if expert_members:
         num_groups = len(expert_members)
         num_experts = sum(len(v) for v in expert_members.values())
-        logger.info(f"Grouped {num_experts} expert tensors into {num_groups} groups")
+        logger.info(f"Grouped {num_experts} expert tensors into {num_groups} groups "
+                     f"(NRMSE aggregation: {moe_aggregation})")
 
     return grouped_tensors, expert_members
 
@@ -184,13 +215,28 @@ def build_tensor_specs(
     rd_data: Dict,
     total_layers: int,
     moe_aggregation: str = "weighted_mean",
+    speed_mode: str = "balanced",
 ) -> Tuple[List[Dict], Dict]:
     """Build tensor specs for the allocator from RD curve data.
+
+    Args:
+        rd_data: Rate-distortion data with per-tensor curves.
+        total_layers: Total number of transformer layers.
+        moe_aggregation: How to aggregate NRMSE across experts.
+        speed_mode: Controls which bit widths are allowed.
+            "balanced" (default): drops 5-bit (worst dequant overhead), keeps 6-bit.
+            "full": all 14 configs including 5/6-bit, best PPL.
+            "fast": power-of-2 bits only (2/4/8/16), fastest inference.
 
     Returns:
         specs: list of tensor specs for the allocator
         expert_members: dict mapping group names to member tensor names
     """
+    configs_to_use = SPEED_CONFIGS.get(speed_mode, VALID_CONFIGS)
+    if speed_mode != "full":
+        logger.info(f"Speed mode '{speed_mode}': using {len(configs_to_use)} configs "
+                     f"(bits: {sorted(set(b for b, _ in configs_to_use))})")
+
     # Group MoE experts for joint allocation
     grouped_tensors, expert_members = _group_moe_experts(rd_data, moe_aggregation)
 
@@ -218,7 +264,7 @@ def build_tensor_specs(
         valid_configs = []
         rd_curve = {}
 
-        for bits, gs in VALID_CONFIGS:
+        for bits, gs in configs_to_use:
             cfg_key = f"{bits}_{gs}"
             if bits >= 16:
                 valid_configs.append((bits, gs))
@@ -430,6 +476,7 @@ def allocate_greedy(
         "solver": "greedy",
         "solver_runtime_ms": elapsed_ms,
         "sqnr_floor_db": SQNR_FLOOR_DB,
+        "moe_aggregation": "weighted_mean",  # default; overridden by caller if needed
         "num_tensors": len(allocations),
         "allocations": allocations,
     }
@@ -446,6 +493,20 @@ def main():
         "--min-safe", action="store_true",
         help="Produce the smallest possible model that respects the SQNR safety floor"
     )
+    parser.add_argument(
+        "--moe-aggregation", choices=["weighted_mean", "max"], default="weighted_mean",
+        help="How to aggregate NRMSE across experts in a group: "
+             "'weighted_mean' (default, consistent with additive objective) or "
+             "'max' (legacy worst-case behavior)"
+    )
+    parser.add_argument(
+        "--speed-mode", choices=["full", "balanced", "fast"], default="balanced",
+        help="Controls which bit widths are allowed. "
+             "'balanced' (default): drops 5-bit (worst dequant overhead), keeps 6-bit — "
+             "best quality/speed tradeoff. "
+             "'full': all configs including 5/6-bit, marginally better PPL. "
+             "'fast': power-of-2 bits only (2/4/8/16), fastest inference."
+    )
     args = parser.parse_args()
 
     rd_data = json.load(open(args.rd_curves))
@@ -453,7 +514,9 @@ def main():
 
     logger.info(f"Loaded RD curves: {rd_data['num_2d_tensors']} 2D + {rd_data['num_1d_tensors']} 1D tensors")
 
-    specs, expert_members = build_tensor_specs(rd_data, total_layers)
+    specs, expert_members = build_tensor_specs(
+        rd_data, total_layers, args.moe_aggregation, speed_mode=args.speed_mode
+    )
     min_safe_bytes = compute_min_safe_size(specs)
     min_safe_gb = min_safe_bytes / (1024**3)
 
