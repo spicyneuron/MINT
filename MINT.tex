@@ -1124,76 +1124,145 @@ All code is available at \url{https://github.com/baa-ai/MINT}. Pre-quantized mod
 \label{sec:cross_platform}
 % ═══════════════════════════════════════════════════════════════════════════════
 
-While MINT's native target is the MLX framework on Apple Silicon, the MCKP allocation framework generalises to any quantization ecosystem that supports per-tensor type selection. We demonstrate this by extending MINT to GGUF~\cite{ggml}, the format used by llama.cpp, Ollama, and LM~Studio, enabling deployment on NVIDIA GPUs, x86 CPUs, and any platform supported by llama.cpp.
+While MINT's native target is the MLX framework on Apple Silicon, cross-platform deployment via GGUF~\cite{ggml} (used by llama.cpp, Ollama, and LM~Studio) is a natural question: can MINT's per-tensor allocation improve GGUF quality on NVIDIA GPUs, x86 CPUs, and other platforms?
 
-\subsection{Method: MINT-Informed K-Quant Allocation}
+We conducted a thorough investigation, including both MCKP-based per-tensor K-quant allocation and a custom llama.cpp fork implementing per-tensor group-size control. Our conclusion is that \textbf{MINT provides only marginal improvement over standard GGUF quantization}, and we recommend using standard K-quant types (e.g., Q4\_K\_M) for GGUF deployment.
 
-Standard GGUF quantization applies a fixed heuristic (e.g., Q4\_K\_M assigns Q6\_K to attention value/output tensors and Q4\_K elsewhere). MINT replaces this heuristic with data-driven optimisation:
+\subsection{Experiment 1: MINT-Informed K-Quant Allocation}
 
-\begin{enumerate}
-    \item \textbf{Profile}: For each weight tensor $\mathbf{W}_i$, we quantize with every candidate K-quant type $\mathcal{K} = \{\text{Q2\_K}, \text{Q3\_K}, \text{Q4\_K}, \text{Q5\_K}, \text{Q6\_K}, \text{Q8\_0}\}$ using \texttt{llama-quantize --pure}, then read back and compute NRMSE and SQNR against the F16 reference.
-    \item \textbf{Allocate}: Solve the MCKP over K-quant candidates, using exact bits-per-weight values (e.g., Q2\_K = 2.625, Q4\_K = 4.5, Q8\_0 = 8.5\,BPW) and measured NRMSE as the distortion function. The SQNR safety veto (9\,dB) and soft protection priors transfer directly.
-    \item \textbf{Apply}: Export a \texttt{tensor-type-file} mapping each tensor to its optimal K-quant type, then apply via \texttt{llama-quantize --tensor-type-file}.
-\end{enumerate}
-
-\subsection{Results}
-
-We evaluate on Qwen3.5-35B-A3B (35B parameters, 3B active, MoE with 256 experts), creating MINT-optimised GGUFs at five VRAM budgets from a single profiling pass.
+We applied MINT's MCKP framework to select among K-quant types $\{\text{Q2\_K}, \text{Q3\_K}, \text{Q4\_K}, \text{Q5\_K}, \text{Q6\_K}, \text{Q8\_0}\}$ on a per-tensor basis, profiling reconstruction error via \texttt{llama-quantize --pure} and solving for budget-optimal allocations.
 
 \begin{table}[h]
 \centering
-\caption{MINT-informed GGUF vs.\ uniform Q4\_K\_M on Qwen3.5-35B-A3B. Perplexity evaluated on WikiText-2 (2048 context, 145 chunks) via \texttt{llama-perplexity}.}
+\caption{MINT GGUF vs.\ standard K-quant types on Qwen3.5-35B-A3B. All perplexity evaluated on WikiText-2 (2048 context, 145 chunks) via \texttt{llama-perplexity} on Apple M2 Ultra with full GPU offload.}
 \label{tab:gguf_results}
-\begin{tabular}{lrrrc}
+\begin{tabular}{lrrl}
 \toprule
-\textbf{Model} & \textbf{Size (GB)} & \textbf{Compression} & \textbf{PPL} & \textbf{vs.\ Q4\_K\_M} \\
+\textbf{Model} & \textbf{Size (GB)} & \textbf{PPL} & \textbf{Notes} \\
 \midrule
-BF16 (reference) & 67.0 & 1.0$\times$ & ${\sim}$6.10 & --- \\
-MINT 48\,GB & 48.0 & 1.4$\times$ & 6.2266 & $-$1.8\% \\
-MINT 34\,GB & 34.0 & 2.0$\times$ & 6.2304 & $-$1.7\% \\
-MINT 28\,GB & 28.1 & 2.4$\times$ & 6.2177 & $-$1.9\% \\
-MINT 21\,GB & 21.0 & 3.2$\times$ & 6.2543 & $-$1.4\% \\
-Q4\_K\_M (uniform) & 19.7 & 3.4$\times$ & 6.3413 & baseline \\
-MINT 15\,GB & 15.1 & 4.5$\times$ & 6.6685 & $+$5.2\% \\
+MINT 48\,GB & 48.0 & 6.23 & ties Q8\_0 \\
+MINT 34\,GB & 34.0 & 6.23 & ties Q8\_0 \\
+Q8\_0 (standard) & 34.0 & 6.22 & \\
+MINT 28\,GB & 28.0 & 6.22 & ties Q6\_K \\
+Q6\_K (standard) & 27.0 & 6.23 & \\
+MINT 21\,GB & 21.0 & 6.25 & \textbf{$-$1.6\% vs Q4\_K\_M} \\
+Q4\_K\_M (standard) & 20.0 & 6.35 & \\
+Q3\_K\_M (standard) & 16.0 & 6.30 & \\
+MINT 15\,GB & 15.0 & 6.67 & aggressive compression \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-At sizes above 20\,GB, MINT-informed allocation consistently outperforms Q4\_K\_M by 1.4--1.9\% PPL despite Q4\_K\_M already including its own mixed-precision heuristic (Q6\_K for attention value and output tensors). The 15\,GB model trades quality for size to fit within RTX~3090 VRAM (24\,GB), achieving 4.5$\times$ compression from BF16.
+MINT's MCKP allocation provides a measurable improvement only at the 21\,GB size point ($-$1.6\% PPL vs Q4\_K\_M). At larger sizes, MINT ties the nearest standard K-quant type. This contrasts sharply with MLX, where MINT achieves 3--6\% PPL improvements.
 
-\paragraph{Inference performance.}
-MINT-informed GGUFs incur no runtime overhead---they use standard K-quant kernels and run at native llama.cpp speed. On an NVIDIA RTX~3090 via Ollama, the 15\,GB Qwen3.5-35B model generates at 73\,tok/s; the 4.7\,GB Llama-3.1-8B model at 132\,tok/s.
+\subsection{Experiment 2: Per-Tensor Group-Size Control}
 
-\subsection{Why the GGUF Improvement Is Smaller Than MLX}
+To test whether MINT's group-size lever (its primary quality driver on MLX) could improve GGUF, we forked llama.cpp and implemented two new quantization types: Q4\_1\_64 (group size~64) and Q4\_1\_128 (group size~128), adding full Metal GPU kernel support including mul\_mv, mul\_mm, get\_rows, and MoE dispatch.
 
-On MLX, MINT controls two allocation variables per tensor: \emph{bit-width} and \emph{group size} (32, 64, or 128 elements per quantization group). Our evidence shows group-size selection provides larger quality gains than bit-width changes---on Qwen3-30B-A3B, 85\% of tensors receive group size~32 instead of the default~128.
+\begin{table}[h]
+\centering
+\caption{Uniform group-size comparison on Qwen3-8B. GPU perplexity on WikiText-2 (2048 context, 145 chunks).}
+\label{tab:group_size}
+\begin{tabular}{lrrrl}
+\toprule
+\textbf{Type} & \textbf{Group Size} & \textbf{Size (GB)} & \textbf{PPL} & \textbf{vs.\ gs=32} \\
+\midrule
+Q4\_1 & 32 & 4.9 & 9.3509 & baseline \\
+Q4\_1\_64 & 64 & 4.4 & \textbf{9.1695} & $-$1.9\% \textbf{and} 10\% smaller \\
+Q4\_1\_128 & 128 & 4.2 & 9.5659 & $+$2.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-In GGUF, each K-quant type has a \emph{fixed} block structure (e.g., Q4\_K uses 256-element super-blocks). MINT can only select \emph{which} K-quant type each tensor receives, not the internal block geometry. This eliminates MINT's primary quality lever, explaining why the improvement drops from 3--5\% (MLX) to 1.5--2\% (GGUF).
+While this confirmed that group size~64 uniformly beats group size~32, a per-tensor MCKP allocation mixing Q4\_1/Q4\_1\_64/Q4\_1\_128 did not beat uniform Q4\_1\_64. More importantly, \emph{none of these affine types beat standard K-quants at comparable sizes}. K-quants use a hierarchical super-block design (256-element blocks with quantized sub-block scales) that is inherently more bit-efficient than simple affine quantization, regardless of group-size tuning.
 
-\subsection{Bridging the Gap: Requests for Inference Runtimes}
-\label{sec:asks}
+\subsection{Why MINT Helps MLX but Not GGUF}
 
-To fully realise MINT's allocation advantage across platforms, inference runtimes would need to support \textbf{per-tensor configurable group size}. We outline specific extensions:
+The key difference is the \emph{base quantization quality}:
 
-\paragraph{Request~1: Per-tensor group-size parameter in llama.cpp.}
-Currently, \texttt{llama-quantize --tensor-type-file} accepts a quant type per tensor (e.g., \texttt{blk.5.attn\_q.weight=Q4\_K}). Extending this to include a group-size parameter (e.g., \texttt{blk.5.attn\_q.weight=Q4\_K:gs32}) would allow MINT to select both the quantization algorithm and the group granularity. Implementation options include:
 \begin{itemize}
-    \item New quant type variants: \texttt{Q4\_K\_G32}, \texttt{Q4\_K\_G64}, \texttt{Q4\_K\_G128}
-    \item A per-tensor metadata field in GGUF alongside the existing quant type
-    \item Extended \texttt{--tensor-type-file} syntax with group-size suffix
+    \item \textbf{MLX} uses simple round-to-nearest affine quantization ($\hat{w} = s \cdot w_{\text{int}} + b$) with FP16 scale and bias per group. This is a relatively inefficient format---the overhead of two FP16 values per group is substantial, and there is significant room for intelligent per-tensor allocation to compensate.
+    \item \textbf{GGUF K-quants} use hierarchical super-blocks with quantized sub-block scales, amortising overhead more efficiently. The built-in heuristics (e.g., Q4\_K\_M assigns Q6\_K to attention value/output tensors) already capture the most important per-tensor sensitivity differences.
 \end{itemize}
-The dequantization kernel changes are minimal: the inner loop stride changes from a compile-time constant to a per-tensor parameter read from metadata.
 
-\paragraph{Request~2: Simple affine quant type with variable block size.}
-A new GGUF type implementing per-group affine quantization ($\hat{w} = s \cdot w_{\text{int}} + b$, where $s$ and $b$ are FP16 per-group scale and bias) with a configurable block size would directly mirror MLX's quantization. This is functionally identical to the existing Q4\_1 type but with block size as a parameter rather than fixed at~32. The kernel is a single fused dequant-matmul operation with no algorithmic complexity.
+MINT's per-tensor allocation provides large gains when the base format leaves room for improvement (MLX), but only marginal gains when the base format is already well-optimised (GGUF K-quants).
 
-\paragraph{Request~3: Per-tensor group-size in vLLM and TensorRT-LLM.}
-These frameworks support per-layer bit-width configuration but apply a global group size. Extending their quantization config to accept per-tensor group sizes would enable MINT's full allocation on NVIDIA's production inference stack.
+\subsection{Recommendation}
 
-\paragraph{Request~4: External allocation API for ExLlamaV2.}
-ExLlamaV2's EXL2 format supports per-tensor bit allocation but derives it from calibration data. An API to inject externally computed allocations would combine MINT's data-free, budget-constrained optimisation with EXL2's highly optimised CUDA inference kernels.
+For cross-platform GGUF deployment, we recommend using standard \texttt{llama-quantize} with appropriate K-quant types (Q4\_K\_M for 24\,GB GPUs, Q3\_K\_M for 16\,GB). MINT's value proposition remains strongest on MLX, where per-tensor bit-width and group-size allocation yields 3--6\% PPL improvement over uniform quantization. MINT-optimised GGUFs are available for users who want the marginal improvement, but the practical benefit does not justify changing the standard GGUF quantization workflow.
 
-\paragraph{Estimated impact.}
-If llama.cpp adopted Request~1 alone (per-tensor group-size), MINT-informed GGUF would improve from 1.5--2\% to an estimated 3--5\% PPL improvement---matching MLX quality while maintaining 70--130\,tok/s on commodity NVIDIA hardware. This would make budget-targeted, data-free, mixed-precision quantization a practical deployment option across all major inference platforms.
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Alternative Quantization Methods: Negative Results}
+\label{sec:alternative_methods}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+We evaluated three alternative data-free quantization methods as potential improvements to MINT's RTN base quantizer. All experiments used Qwen3.5-35B-A3B at 4-bit with group size~64. None improved model-level perplexity, despite per-tensor reconstruction error improvements in two cases.
+
+\subsection{HQQ (Half-Quadratic Quantization)}
+
+HQQ~\cite{badri2024hqq} uses iterative half-quadratic optimization to find better per-group scale and zero-point parameters than RTN's simple min/max. It is fully data-free and produces the same affine format ($\hat{w} = s \cdot w_{\text{int}} + b$), making it directly compatible with MLX's inference kernels.
+
+\paragraph{Per-tensor results.} HQQ reduces per-tensor NRMSE by 2.96\% on average (30/30 tensors improved, range 2.86--3.70\%). We verified lossless conversion to MLX's packed format ($<$0.01\% conversion loss).
+
+\paragraph{Model-level results.} Despite the per-tensor improvement, full-model perplexity \emph{worsened} by 0.8\%:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Median PPL} & \textbf{vs.\ RTN} \\
+\midrule
+RTN (baseline) & 6.783 & --- \\
+HQQ & 6.857 & $+$0.8\% (worse) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Interpretation.} HQQ optimises mean squared error per group, but perplexity is sensitive to specific error patterns---particularly outlier weights in attention projections. RTN's min/max clipping naturally preserves extreme values that disproportionately affect model output. Lower reconstruction error does not imply better downstream performance.
+
+\subsection{Hadamard Rotation Preprocessing}
+
+Random orthogonal rotation (via Hadamard matrices) spreads weight outliers across all elements before quantization, reducing the dynamic range each group must represent. This technique is used in QuIP~\cite{chee2024quip} and QuIP\#~\cite{tseng2024quip_sharp}, though those methods also require calibration data.
+
+\paragraph{Per-tensor results.} Hadamard rotation reduces NRMSE by 7.92\% on average (30/30 tensors improved, range 0.36--15.51\%)---the largest per-tensor improvement of any method tested.
+
+\paragraph{Deployment blocker.} Hadamard rotation cannot be deployed on MLX without custom Metal kernels. Each matrix-vector multiply requires an additional rotation: $y = W_q (H^T x)$ instead of $y = W_q x$, where $H$ is the per-group Hadamard matrix. MLX's \texttt{QuantizedLinear} does not support this, and adding it would require modifying the inference path. Given that the HQQ experiment showed per-tensor NRMSE improvement does not translate to PPL improvement, we did not pursue custom kernel development.
+
+\subsection{Data-Free OBQ (Optimal Brain Quantization)}
+
+Optimal Brain Quantization~\cite{frantar2023gptq} uses the Hessian $H = X^T X$ to determine quantization order and compensate remaining weights for each quantization error. In the data-free setting, we approximate $H \approx W^T W$ using only the weight matrix itself. This diagonal approximation quantises elements in order of increasing sensitivity (lowest $\|w_i\|^2$ first) and distributes each quantization error to remaining elements.
+
+\paragraph{Per-tensor results.} The weight-only OBQ proxy consistently \emph{worsened} reconstruction: $-$0.50\% mean NRMSE (0/18 tensors improved, range $-$0.54\% to $-$0.45\%).
+
+\paragraph{Interpretation.} The weight-only Hessian $W^T W$ is a poor proxy for the true activation Hessian $X^T X$. Without knowledge of the actual input distribution, the sensitivity ordering is essentially random with respect to what matters for model output. This confirms that OBQ-style methods fundamentally require calibration data and cannot be meaningfully adapted to the data-free setting.
+
+\subsection{AdaRound-Style Learned Rounding}
+
+AdaRound~\cite{nagel2020adaround} learns per-element rounding directions (up vs.\ down) by minimising $\|Wx - \hat{W}x\|^2$ over calibration inputs $x$. In the data-free setting, we replace the activation-weighted objective with the weight-only objective $\|W - \hat{W}\|^2$, optimising soft rounding variables $v_i$ via 200 iterations of Adam ($\text{lr}=0.01$) with sigmoid annealing.
+
+\paragraph{Result.} Data-free AdaRound produces \textbf{exactly 0.000\%} NRMSE change on all 30 tensors tested. Without activation data to weight the MSE, the optimal rounding direction for each element is ``round to nearest''---which is what RTN already computes. The gradient descent converges to the RTN solution. AdaRound's power comes entirely from its activation-weighted objective, not from the rounding optimisation itself.
+
+\subsection{Summary}
+
+\begin{table}[h]
+\centering
+\caption{Alternative quantization methods evaluated on Qwen3.5-35B-A3B (4-bit, gs=64). Per-tensor NRMSE improvement does not predict model-level PPL improvement.}
+\label{tab:alt_methods}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Per-Tensor NRMSE} & \textbf{Model PPL} & \textbf{Deployable?} \\
+\midrule
+RTN (baseline) & --- & 6.783 & Yes \\
+HQQ & $+$2.96\% better & 6.857 ($+$0.8\% worse) & Yes \\
+Hadamard rotation & $+$7.92\% better & not tested$^\dagger$ & No \\
+OBQ (data-free) & $-$0.50\% worse & not tested & Yes \\
+AdaRound (data-free) & $\pm$0.00\% & $=$ RTN & Yes \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+{\small $^\dagger$Not tested at model level because (a) requires custom inference kernels and (b) HQQ showed per-tensor NRMSE does not predict PPL.}
+\end{table}
+
+These results validate RTN as the appropriate base quantizer for data-free mixed-precision quantization. MINT's value comes from \emph{where} bits are allocated (per-tensor budget optimisation), not from \emph{how} individual tensors are quantised. Improving the base quantizer---whether through iterative optimisation (HQQ), rotation (Hadamard), greedy compensation (OBQ), or learned rounding (AdaRound)---does not improve downstream quality in the data-free setting.
 
 \end{document}
