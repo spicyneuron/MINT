@@ -117,6 +117,94 @@ def fit_prediction_curve(sweep_results, calibration_points):
     return None, None
 
 
+def plot_quality_curve(sweep_results, model_name, predict_fn=None, bf16_ppl=None,
+                       calibration_points=None, output_path="quality_curve.png"):
+    """Plot quality vs size curve."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+
+    sizes = [r['actual_gb'] for r in sweep_results]
+    losses = [r['total_loss'] for r in sweep_results]
+    avg_bits = [r['avg_bits'] for r in sweep_results]
+
+    fig, ax1 = plt.subplots(1, 1, figsize=(12, 7))
+
+    if predict_fn and bf16_ppl:
+        # Plot predicted PPL
+        ppls = [predict_fn(r['total_loss']) for r in sweep_results]
+        ax1.plot(sizes, ppls, 'o-', color='#991b1b', linewidth=2.5, markersize=6,
+                 label='MINT predicted PPL', zorder=3)
+
+        # BF16 reference line
+        ax1.axhline(y=bf16_ppl, color='#2563eb', linestyle='--', linewidth=1.5,
+                     alpha=0.7, label=f'BF16 reference ({bf16_ppl:.3f})')
+
+        # +1% and +2% reference lines
+        ax1.axhline(y=bf16_ppl * 1.01, color='#16a34a', linestyle=':', linewidth=1,
+                     alpha=0.5, label='+1% vs BF16')
+        ax1.axhline(y=bf16_ppl * 1.02, color='#ca8a04', linestyle=':', linewidth=1,
+                     alpha=0.5, label='+2% vs BF16')
+
+        # Calibration points
+        if calibration_points:
+            cal_sizes = []
+            cal_ppls_actual = []
+            for cal_budget, cal_ppl in calibration_points:
+                closest = min(sweep_results, key=lambda r: abs(r['budget_gb'] - cal_budget))
+                cal_sizes.append(closest['actual_gb'])
+                cal_ppls_actual.append(cal_ppl)
+            ax1.scatter(cal_sizes, cal_ppls_actual, s=120, color='#991b1b', marker='*',
+                        zorder=5, label='Measured PPL (calibration)')
+
+        ax1.set_ylabel('Predicted Median PPL', fontsize=12)
+        ylabel_text = 'Predicted Median Perplexity'
+    else:
+        # Plot allocation loss (no calibration)
+        ax1.plot(sizes, losses, 'o-', color='#991b1b', linewidth=2.5, markersize=6,
+                 label='Allocation loss (lower = better)', zorder=3)
+        ax1.set_ylabel('Allocation Loss (NRMSE sum)', fontsize=12)
+        ylabel_text = 'Allocation Loss'
+
+    ax1.set_xlabel('Model Size (GB)', fontsize=12)
+    ax1.set_title(f'MINT Quality vs Size: {model_name}', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='upper right', fontsize=10)
+
+    # Add avg bits as secondary x-axis labels on top
+    ax2 = ax1.twiny()
+    ax2.set_xlim(ax1.get_xlim())
+    # Pick a subset of tick positions
+    tick_indices = list(range(0, len(sizes), max(1, len(sizes) // 8)))
+    ax2.set_xticks([sizes[i] for i in tick_indices])
+    ax2.set_xticklabels([f'{avg_bits[i]:.1f}b' for i in tick_indices], fontsize=9)
+    ax2.set_xlabel('Average Bits', fontsize=10, labelpad=8)
+
+    # Annotate the knee/sweet spot
+    if len(sweep_results) >= 5:
+        # Find where 3-bit drops out
+        for i, r in enumerate(sweep_results):
+            has_3bit = any(int(b) <= 3 and info['percentage'] > 1
+                         for b, info in r['bits_distribution'].items())
+            if not has_3bit and i > 0:
+                knee_size = r['actual_gb']
+                if predict_fn and bf16_ppl:
+                    knee_ppl = predict_fn(r['total_loss'])
+                    ax1.annotate(f'No 3-bit\n({knee_size:.0f} GB)',
+                                xy=(knee_size, knee_ppl),
+                                xytext=(knee_size + (sizes[-1] - sizes[0]) * 0.08,
+                                        knee_ppl + (ax1.get_ylim()[1] - ax1.get_ylim()[0]) * 0.08),
+                                arrowprops=dict(arrowstyle='->', color='#666'),
+                                fontsize=9, color='#666')
+                break
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\nGraph saved to {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Predict quantized model quality before conversion",
@@ -144,6 +232,7 @@ Examples:
     parser.add_argument("--calibrate", action="append", metavar="BUDGET:PPL",
                         help="Calibration point as BUDGET_GB:MEDIAN_PPL (can specify multiple)")
     parser.add_argument("--output", help="Save results to JSON")
+    parser.add_argument("--graph", help="Save quality-vs-size graph to PNG/PDF")
     args = parser.parse_args()
 
     rd_data = json.load(open(args.rd_curves))
@@ -256,6 +345,11 @@ Examples:
             if (pred - bf16_ppl) / bf16_ppl < 0.01:
                 print(f"  Matches BF16 (within 1%): ~{r['budget_gb']:.0f} GB")
                 break
+
+    # Graph
+    if args.graph:
+        plot_quality_curve(sweep_results, model_name, predict_fn, bf16_ppl,
+                           calibration_points, args.graph)
 
     # Save
     if args.output:
