@@ -254,6 +254,7 @@ Available on [HuggingFace baa-ai](https://huggingface.co/baa-ai):
 | `convert_gguf.py` | 4b | GGUF conversion via llama.cpp |
 | `eval_perplexity.py` | 5 | WikiText-2 perplexity evaluation |
 | `run_experiment.py` | 4a+5 | Orchestrator: convert + eval in one command |
+| `predict_quality.py` | 2+ | Predict PPL before conversion (budget sweep) |
 | `analyze_allocation.py` | — | Inspect/compare allocations |
 
 ## Requirements
