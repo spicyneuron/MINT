@@ -232,7 +232,10 @@ Examples:
     parser.add_argument("--calibrate", action="append", metavar="BUDGET:PPL",
                         help="Calibration point as BUDGET_GB:MEDIAN_PPL (can specify multiple)")
     parser.add_argument("--output", help="Save results to JSON")
-    parser.add_argument("--graph", help="Save quality-vs-size graph to PNG/PDF")
+    parser.add_argument("--graph", nargs="?", const="auto", default=None,
+                        help="Save and open quality-vs-size graph. Optionally specify output path "
+                             "(default: auto-generated temp file, opened in browser)")
+    parser.add_argument("--no-graph", action="store_true", help="Suppress automatic graph display")
     args = parser.parse_args()
 
     rd_data = json.load(open(args.rd_curves))
@@ -346,10 +349,25 @@ Examples:
                 print(f"  Matches BF16 (within 1%): ~{r['budget_gb']:.0f} GB")
                 break
 
-    # Graph
-    if args.graph:
+    # Graph — show by default unless --no-graph
+    if not args.no_graph:
+        import tempfile, platform, subprocess
+        if args.graph and args.graph != "auto":
+            graph_path = args.graph
+        else:
+            graph_path = tempfile.mktemp(suffix=".png", prefix="mint_quality_")
         plot_quality_curve(sweep_results, model_name, predict_fn, bf16_ppl,
-                           calibration_points, args.graph)
+                           calibration_points, graph_path)
+        # Auto-open
+        try:
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", graph_path])
+            elif platform.system() == "Linux":
+                subprocess.Popen(["xdg-open", graph_path])
+            elif platform.system() == "Windows":
+                subprocess.Popen(["start", graph_path], shell=True)
+        except Exception:
+            pass  # silently skip if no display
 
     # Save
     if args.output:
