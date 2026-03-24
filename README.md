@@ -45,6 +45,8 @@ BF16 Model (HuggingFace safetensors)
     ▼
 [Step 1] compute_rd_curves.py     ── NRMSE + SQNR at 13 (bits, group_size) configs per tensor
     │
+    ├─── predict_quality.py       ── Sweep budgets, graph quality curve, pick your target
+    │         (optional)              (opens graph automatically — no conversion needed)
     ▼
 [Step 2] allocator.py             ── MCKP solver: pick (bits, gs) per tensor under your budget
     │
@@ -134,6 +136,39 @@ python allocator.py --rd-curves rd_curves.json --budget-gb 24 --output alloc-24g
 python allocator.py --rd-curves rd_curves.json --budget-gb 48 --output alloc-48gb.json
 python allocator.py --rd-curves rd_curves.json --min-safe   --output alloc-min-safe.json
 ```
+
+### Predict Quality Before Converting
+
+`predict_quality.py` sweeps budget levels and estimates perplexity **before you spend time on conversion and evaluation**. It auto-opens an interactive quality-vs-size graph so you can pick the right budget visually.
+
+```bash
+# Sweep budgets and show the quality curve (graph opens automatically)
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50
+
+# With calibration — measure PPL at one budget, predict all others
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 \
+    --calibrate 20.0:6.693
+
+# Two calibration points for higher accuracy (r=0.97, RMSE ~0.01 PPL)
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 \
+    --calibrate 20.0:6.693 --calibrate 30.0:6.587
+
+# Save graph to a specific file
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 \
+    --graph quality_curve.png
+
+# Table only, no graph
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 --no-graph
+```
+
+The graph shows:
+- **Predicted PPL curve** vs model size (with calibration) or allocation loss (without)
+- **BF16 reference line** with +1% and +2% quality guides
+- **Calibration points** (measured PPL) plotted as stars
+- **Average bits** on the top axis
+- **Knee annotation** where 3-bit allocations drop out
+
+Without calibration, the tool shows relative quality (allocation loss) — useful for comparing budgets and finding diminishing returns. With one or two calibration points (a single PPL evaluation), it fits a prediction curve and estimates absolute PPL at every budget.
 
 ## Allocator Options
 
@@ -254,7 +289,7 @@ Available on [HuggingFace baa-ai](https://huggingface.co/baa-ai):
 | `convert_gguf.py` | 4b | GGUF conversion via llama.cpp |
 | `eval_perplexity.py` | 5 | WikiText-2 perplexity evaluation |
 | `run_experiment.py` | 4a+5 | Orchestrator: convert + eval in one command |
-| `predict_quality.py` | 2+ | Predict PPL before conversion (budget sweep) |
+| `predict_quality.py` | 1→2 | Predict PPL before conversion (sweep + graph) |
 | `analyze_allocation.py` | — | Inspect/compare allocations |
 
 ## Requirements
@@ -282,6 +317,7 @@ datasets       # WikiText-2 download
 
 # Optional
 scipy          # LP/ILP solvers (greedy default has no dependency)
+matplotlib     # Quality curve graph (predict_quality.py)
 ```
 
 ## Citation
