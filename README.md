@@ -5,6 +5,7 @@
       <source media="(prefers-color-scheme: light)" srcset="./baa-logo.svg">
       <img alt="Black Sheep AI" src="./baa-logo.svg" width="390">
     </picture>
+    <br>https://baa.ai
   </a>
 </p>
 
