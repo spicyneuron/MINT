@@ -5,6 +5,7 @@
       <source media="(prefers-color-scheme: light)" srcset="./baa-logo.svg">
       <img alt="Black Sheep AI" src="./baa-logo.svg" width="390">
     </picture>
+    <br>https://baa.ai
   </a>
 </p>
 
@@ -16,19 +17,16 @@
 
 **You choose the exact model size you want, MINT finds the optimal quantization for that size.**
 
-> **Paper**: [MINT: Compute-Optimal Data-Free Mixed-Precision Quantization for Large Language Models via Rate-Distortion Optimization](https://huggingface.co/spaces/baa-ai/MINT) (preprint)
+> **Paper**: [MINT: Budget-Aware Data-Free Mixed-Precision Quantization for LLMs via Rate-Distortion Optimization](https://huggingface.co/spaces/baa-ai/MINT) (preprint)
 
 ## Key Results
 
-| Model | Size | MINT PPL | Uniform 4-bit PPL | Delta |
-|-------|------|----------|-------------------|-------|
-| Qwen3-30B-A3B | 15.5 GB (26% of BF16) | 8.798 | 9.031 | **-2.6%** |
-| Qwen2-57B-A14B | 32 GB | 8.236 | 8.346 | **-1.3%** |
-| Mixtral-8x7B | 24.5 GB | 5.370 | 5.631 | **-4.6%** |
-| Llama-4-Scout (109B) | 58 GB | 7.703 | 7.899 | **-2.5%** |
-| MiniMax-M2.5 (229B) | 118 GB | 8.787 | 8.957 | **-1.9%** |
-
-All comparisons at matched or smaller model size. PPL values are median perplexity on WikiText-2.
+| Model | Size | MINT PPL | Baseline PPL | Delta |
+|-------|------|----------|-------------|-------|
+| **Qwen3.5-35B-A3B** | **28.3 GB (42% of BF16)** | **6.587** | **6.586 (BF16)** | **+0.0%** |
+| Qwen3-30B-A3B | 19 GB (33% of BF16) | 8.798 | 8.789 (BF16) | +0.1% |
+| Mixtral-8x7B | 24.5 GB | 4.264 | 4.387 (uniform 4-bit) | **-2.8%** |
+| Llama-4-Scout (109B) | 58 GB | 7.703 | 7.899 (uniform 4-bit) | **-2.5%** |
 
 ### vs GPTQ (calibration-based)
 
@@ -36,214 +34,299 @@ MINT consistently outperforms GPTQ despite being entirely data-free:
 
 | Model | MINT PPL | GPTQ PPL | Delta |
 |-------|----------|----------|-------|
-| Qwen3-30B-A3B | 8.798 | 8.949 | **-1.7%** |
-| Qwen2-57B-A14B | 8.236 | 8.315 | **-0.95%** |
-| Mixtral-8x7B | 5.370 | 5.631 | **-4.6%** |
+| Qwen3-30B-A3B | 9.020 | 9.160 | **-1.5%** |
+| Qwen2-57B-A14B | 6.356 | 6.396 | **-0.6%** |
+| Mixtral-8x7B | 4.266 | 4.640 | **-4.6%** |
 
 ## How It Works
 
 ```
-BF16 Model
-    |
-    v
-[Step 1] compute_rd_curves.py     -- NRMSE + SQNR at 8 (bits, group_size) configs per tensor
-    |
-    v
-[Step 2] allocator.py             -- MCKP solver: choose (bits, gs) per tensor under budget
-    |
-    v
-[Step 3] build_manifest.py        -- Bundle allocation + tensor metadata into manifest JSON
-    |
-    v
-[Step 4] convert.py               -- MLX quantization using manifest's per-tensor decisions
-    |
-    v
-[Step 5] eval_perplexity.py       -- WikiText-2 perplexity (mean, median, trimmed)
+BF16 Model (HuggingFace safetensors)
+    │
+    ▼
+[Step 1] compute_rd_curves.py     ── NRMSE + SQNR at 13 (bits, group_size) configs per tensor
+    │
+    ├─── predict_quality.py       ── Sweep budgets, graph quality curve, pick your target
+    │         (optional)              (opens graph automatically — no conversion needed)
+    ▼
+[Step 2] allocator.py             ── MCKP solver: pick (bits, gs) per tensor under your budget
+    │
+    ▼
+[Step 3] build_manifest.py        ── Bundle allocation + tensor metadata → manifest JSON
+    │
+    ├──────────────────────┐
+    ▼                      ▼
+[Step 4a] convert.py       [Step 4b] convert_gguf.py
+    MLX model                 GGUF model
+    (Apple Silicon)            (Ollama / llama.cpp / LM Studio)
+    │
+    ▼
+[Step 5] eval_perplexity.py ── WikiText-2 PPL (mean, median, trimmed)
 ```
-
-MINT formulates quantization as a constrained optimization:
-
-```
-minimize   sum_i  prior_i * NRMSE_i(bits_i, gs_i)
-subject to sum_i  size_i(bits_i, gs_i) <= Budget
-```
-
-Where each tensor has a rate-distortion curve measuring reconstruction error at 8 different (bits, group_size) configurations. The MCKP solver finds the provably optimal allocation in under 1 second.
-
-**Key insight**: Group size is a first-class allocation variable. MINT frequently chooses g32 over g128 at the same bit-width -- the 4x more quantization groups provide better accuracy at minimal overhead, often yielding larger quality gains than bit-width upgrades.
 
 ## Quick Start
 
-```bash
-# Install dependencies
-pip install torch safetensors mlx mlx-lm numpy scipy datasets
+### Install
 
-# Full pipeline for a model targeting 19 GB:
-python compute_rd_curves.py --model-dir /path/to/Model-BF16 --output rd_curves.json
-python allocator.py --rd-curves rd_curves.json --budget-gb 19.0 --output allocation.json
-python build_manifest.py --allocation allocation.json --model-dir /path/to/Model-BF16 --output manifest.json
-python convert.py --hf-path /path/to/Model-BF16 --mlx-path /path/to/Model-MINT --manifest manifest.json
-python eval_perplexity.py --model /path/to/Model-MINT --output ppl_results.json
+```bash
+pip install torch safetensors mlx mlx-lm numpy scipy datasets
 ```
 
-> **Note:** `torch` is only needed for Step 1 (rate-distortion analysis). It is not needed at inference time. `scipy` is optional (only for LP/ILP solvers; the default greedy solver has no dependency).
+> `torch` is only needed for Step 1 (rate-distortion analysis on CPU). It is not needed at inference time. `scipy` is optional (LP/ILP solvers; the default greedy solver has no dependency).
 
-## Multiple Budget Points from One Analysis
-
-The key advantage: Steps 1 and 3 only run once per model. Re-run Step 2 with different budgets (< 1 sec each):
+### Full Pipeline (MLX — Apple Silicon)
 
 ```bash
-# Analyze once (~30 min for 30B model)
+# Step 1: Analyze model (~30 min for 30B, ~2 hours for 100B+)
+python compute_rd_curves.py \
+    --model-dir /path/to/Model-BF16 \
+    --output rd_curves.json
+
+# Step 2: Allocate to your memory budget (< 1 second)
+python allocator.py \
+    --rd-curves rd_curves.json \
+    --budget-gb 28.0 \
+    --output allocation.json
+
+# Step 3: Build manifest
+python build_manifest.py \
+    --allocation allocation.json \
+    --model-dir /path/to/Model-BF16 \
+    --output manifest.json
+
+# Step 4: Convert to MLX quantized model
+python convert.py \
+    --hf-path /path/to/Model-BF16 \
+    --mlx-path /path/to/Model-MINT \
+    --manifest manifest.json
+
+# Step 5: Evaluate perplexity
+python eval_perplexity.py \
+    --model /path/to/Model-MINT \
+    --output ppl_results.json
+```
+
+### Full Pipeline (GGUF — Any Platform)
+
+Steps 1–3 are the same. Then use `convert_gguf.py`:
+
+```bash
+# Steps 1-3: same as above ...
+
+# Step 4b: Convert to GGUF (requires llama.cpp)
+python convert_gguf.py \
+    --model-dir /path/to/Model-BF16 \
+    --allocation allocation.json \
+    --output Model-MINT.gguf \
+    --llama-cpp /path/to/llama.cpp
+
+# Use with Ollama
+ollama create mymodel -f <(echo "FROM ./Model-MINT.gguf")
+ollama run mymodel
+```
+
+### Multiple Budgets from One Analysis
+
+Step 1 only runs once. Re-run Step 2 with different budgets (< 1 sec each):
+
+```bash
 python compute_rd_curves.py --model-dir /path/to/Model --output rd_curves.json
 
-# Generate allocations at different budgets (< 1 sec each)
 python allocator.py --rd-curves rd_curves.json --budget-gb 16 --output alloc-16gb.json
 python allocator.py --rd-curves rd_curves.json --budget-gb 24 --output alloc-24gb.json
 python allocator.py --rd-curves rd_curves.json --budget-gb 48 --output alloc-48gb.json
 python allocator.py --rd-curves rd_curves.json --min-safe   --output alloc-min-safe.json
 ```
 
-## Pipeline Steps
+### Predict Quality Before Converting
 
-### Step 1: Compute Rate-Distortion Curves
-
-```bash
-python compute_rd_curves.py --model-dir /path/to/Model-BF16 --output rd_curves.json
-```
-
-Loads each safetensor shard and simulates quantization at 8 configurations: `(2,32), (2,64), (3,64), (4,32), (4,64), (4,128), (8,64), (8,128)`. Measures NRMSE and SQNR for every 2D tensor. 3D MoE expert tensors are reshaped to 2D for joint analysis.
-
-**Runtime:** ~30 min for 30B, ~2 hours for 100B+.
-
-### Step 2: Run the Knapsack Allocator
+`predict_quality.py` sweeps budget levels and estimates perplexity **before you spend time on conversion and evaluation**. It auto-opens an interactive quality-vs-size graph so you can pick the right budget visually.
 
 ```bash
-python allocator.py --rd-curves rd_curves.json --budget-gb 19.0 --output allocation.json
+# Sweep budgets and show the quality curve (graph opens automatically)
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50
+
+# With calibration — measure PPL at one budget, predict all others
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 \
+    --calibrate 20.0:6.693
+
+# Two calibration points for higher accuracy (r=0.97, RMSE ~0.01 PPL)
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 \
+    --calibrate 20.0:6.693 --calibrate 30.0:6.587
+
+# Save graph to a specific file
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 \
+    --graph quality_curve.png
+
+# Table only, no graph
+python predict_quality.py --rd-curves rd_curves.json --max-gb 50 --no-graph
 ```
 
-Solves the MCKP with:
-- **SQNR safety veto** (9 dB floor) -- blocks configurations causing severe degradation
-- **Protection priors**: embeddings/lm_head/routers/norms hard-protected at 16-bit; first/last layers get 3x/2x loss multiplier
-- **MoE expert grouping**: worst-case NRMSE across experts per (layer, projection)
+The graph shows:
+- **Predicted PPL curve** vs model size (with calibration) or allocation loss (without)
+- **BF16 reference line** with +1% and +2% quality guides
+- **Calibration points** (measured PPL) plotted as stars
+- **Average bits** on the top axis
+- **Knee annotation** where 3-bit allocations drop out
 
-**Runtime:** < 1 second for any model size.
+Without calibration, the tool shows relative quality (allocation loss) — useful for comparing budgets and finding diminishing returns. With one or two calibration points (a single PPL evaluation), it fits a prediction curve and estimates absolute PPL at every budget.
 
-### Step 3: Build Manifest
+## Allocator Options
+
+### `--budget-gb <size>` / `--min-safe`
+
+Set your target model size in GB. `--min-safe` produces the smallest model that respects the SQNR safety floor (typically all 3-bit).
+
+### `--speed-mode <fast|balanced|full>`
+
+Controls which bit widths the allocator may use. Default: **`balanced`**.
+
+| Mode | Bits Allowed | Use When |
+|------|-------------|----------|
+| `fast` | 2, 4, 8, 16 | You want fastest possible MLX dequantization |
+| **`balanced`** | 2, 3, 4, 6, 8, 16 | **Default.** Best quality/speed tradeoff |
+| `full` | 2, 3, 4, 5, 6, 8, 16 | You want maximum PPL optimization |
+
+**Why `balanced` is the default:** 6-bit fills the 2× cost gap between 4-bit and 8-bit. On Qwen3.5-35B at 30 GB, balanced mode matches BF16 perplexity at 42% of the size and achieves +1.5% higher generation throughput than `fast` mode (a mostly-6-bit model has more uniform dequantization). The 5-bit option (dropped in balanced) has the worst MLX Metal dequant overhead due to irregular bit packing.
 
 ```bash
-python build_manifest.py --allocation allocation.json --model-dir /path/to/Model-BF16 --output manifest.json
+# Balanced (default — recommended)
+python allocator.py --rd-curves rd_curves.json --budget-gb 30.0 --output alloc.json
+
+# Fastest inference
+python allocator.py --rd-curves rd_curves.json --budget-gb 30.0 --speed-mode fast --output alloc.json
+
+# Maximum quality
+python allocator.py --rd-curves rd_curves.json --budget-gb 30.0 --speed-mode full --output alloc.json
 ```
 
-Combines allocation decisions with tensor metadata from model files.
+### `--moe-aggregation <weighted_mean|max>`
 
-### Step 4: Convert Model
+How to aggregate NRMSE across MoE experts. Default: `weighted_mean`.
 
-```bash
-python convert.py --hf-path /path/to/Model-BF16 --mlx-path /path/to/Model-MINT --manifest manifest.json
+## Pipeline Details
+
+### Step 1: Rate-Distortion Curves
+
+Simulates group-wise RTN quantization at **13 configurations**:
+
+```
+2-bit:  (2,32)  (2,64)
+3-bit:  (3,32)  (3,64)
+4-bit:  (4,32)  (4,64)  (4,128)
+5-bit:  (5,32)  (5,64)
+6-bit:  (6,32)  (6,64)
+8-bit:  (8,64)  (8,128)
+16-bit: (16,0)  ← zero-distortion anchor
 ```
 
-Creates an MLX `quant_predicate` that returns `{"bits": N, "group_size": G}` per tensor, then calls `mlx_lm.convert()`. Output is ready for `mlx_lm.load()`.
+Measures NRMSE and SQNR per tensor. 3D MoE tensors use worst-case across experts. Higher-dimensional tensors (vision patch embeddings) are reshaped to 2D.
 
-**Runtime:** 10-60 min depending on model size.
+### Step 2: MCKP Allocation
 
-### Step 5: Evaluate Perplexity
-
-```bash
-python eval_perplexity.py --model /path/to/Model-MINT --num-samples 256 --output ppl.json
+```
+minimize   Σ  prior_i × NRMSE_i(bits_i, gs_i)
+subject to Σ  size_i(bits_i, gs_i)  ≤  Budget
 ```
 
-Reports standard, median, and trimmed mean perplexity on WikiText-2.
+- **SQNR safety veto** (9 dB) — blocks catastrophic 2-bit
+- **Soft priors** — ∞ for norms/embeddings, 3× first layer, 2× last layer
+- **MoE grouping** — all experts in a SwitchLinear share quantization
+- **Speed modes** — control the bit-width search space
 
-## MCKP Formulation
+### Step 4a: MLX Conversion
 
-Each tensor *i* has a set of valid configurations *C_i* after SQNR veto:
+`bridge.py` maps manifest tensor names to MLX module paths, handling:
+- VLM prefix rewriting (`model.language_model.X` ↔ `language_model.model.X`)
+- SwitchLinear expert aggregation (mode of expert bit-widths)
+- Fused `gate_up_proj` → separate `gate_proj`/`up_proj` splitting
+- 2/3/4/5/6/8-bit returns with per-tensor group size
 
-- **Objective**: `minimize sum_i prior_i * NRMSE_i(b_i, g_i)`
-- **Constraint**: `sum_i size_i(b_i, g_i) <= Budget`
-- **NRMSE_i(b, g)**: reconstruction error from rate-distortion curve
-- **prior_i**: protection multiplier (inf for embeddings/norms, 3x first layer, 2x last layer, 1x default)
-- **size_i(b, g)**: `num_params * b/8 + (num_params / g) * 2` bytes
+### Step 4b: GGUF Conversion
 
-The default greedy solver starts all tensors at their lowest valid bit-width, sorts upgrade options by loss-reduction-per-byte, and greedily upgrades until the budget is exhausted. This achieves near-optimal solutions (typically within 0.1% of the LP relaxation bound).
+Maps MINT allocations to GGUF quant types:
 
-## SQNR Safety Veto
+| MINT bits | GGUF type |
+|-----------|-----------|
+| 2 | Q2_K |
+| 3 | Q3_K |
+| 4 | Q4_K |
+| 5 | Q5_K |
+| 6 | Q6_K |
+| 8 | Q8_0 |
+| 16 | F16 |
 
-Configurations with SQNR < 9 dB are vetoed. This exploits a natural gap in the SQNR distribution:
-- 2-bit quantization: max observed 8.7 dB (catastrophic -- PPL triples)
-- 3-bit quantization: min observed 10.4 dB (usable)
-
-The 9 dB threshold sits cleanly in this gap, providing an absolute quality floor.
-
-## MoE Expert Grouping
-
-For Mixture-of-Experts models, MLX's `SwitchLinear` module requires all experts in a layer to share quantization parameters. MINT groups expert tensors by (layer, projection) using:
-- Parameter-weighted mean NRMSE across experts (consistent with additive global objective)
-- Minimum SQNR across experts (safety)
-- Sum of parameters (correct size accounting)
-
-The bridge handles both per-expert manifests (e.g., `experts.0.gate_proj`) and packed 3D expert tensors (e.g., `experts.gate_up_proj`), automatically mapping them to MLX's SwitchLinear modules.
+Requires llama.cpp: `brew install llama.cpp` or build from [source](https://github.com/ggml-org/llama.cpp).
 
 ## Pre-quantized Models
 
-Models quantized with MINT are available on HuggingFace under [baa-ai](https://huggingface.co/baa-ai):
-
-### GGUF (cross-platform: llama.cpp, ollama, LM Studio)
-
-| Model | Size | HuggingFace |
-|-------|------|-------------|
-| Mixtral-8x7B-Instruct | 26 GB | [baa-ai/Mixtral-8x7B-Instruct-SWAN-4bit-GGUF](https://huggingface.co/baa-ai/Mixtral-8x7B-Instruct-SWAN-4bit-GGUF) |
-| Qwen3-30B-A3B | 16 GB | [baa-ai/Qwen3-30B-A3B-SWAN-4bit-GGUF](https://huggingface.co/baa-ai/Qwen3-30B-A3B-SWAN-4bit-GGUF) |
+Available on [HuggingFace baa-ai](https://huggingface.co/baa-ai):
 
 ### MLX (Apple Silicon)
 
-| Model | Size | HuggingFace |
-|-------|------|-------------|
-| Llama-4-Scout | 58 GB | [baa-ai/Llama-4-Scout-17B-16E-Instruct-SWAN-4bit-MLX](https://huggingface.co/baa-ai/Llama-4-Scout-17B-16E-Instruct-SWAN-4bit-MLX) |
-| Llama-4-Maverick | 172 GB | [baa-ai/Llama-4-Maverick-17B-128E-Instruct-SWAN-4bit-MLX](https://huggingface.co/baa-ai/Llama-4-Maverick-17B-128E-Instruct-SWAN-4bit-MLX) |
-| MiniMax-M2.5 | 118 GB | [baa-ai/MiniMax-M2.5-SWAN-4bit-MLX](https://huggingface.co/baa-ai/MiniMax-M2.5-SWAN-4bit-MLX) |
-| GLM-4.7-Flash | 16 GB | [baa-ai/GLM-4.7-Flash-SWAN-4bit-MLX](https://huggingface.co/baa-ai/GLM-4.7-Flash-SWAN-4bit-MLX) |
-| Llama-3.1-70B | 47 GB | [baa-ai/Llama-3.1-70B-Instruct-SWAN-5bit-MLX](https://huggingface.co/baa-ai/Llama-3.1-70B-Instruct-SWAN-5bit-MLX) |
-| Llama-3.3-70B | 47 GB | [baa-ai/Llama-3.3-70B-Instruct-SWAN-5bit-MLX](https://huggingface.co/baa-ai/Llama-3.3-70B-Instruct-SWAN-5bit-MLX) |
+| Model | Size | PPL | Link |
+|-------|------|-----|------|
+| **Qwen3.5-35B-A3B (balanced)** | **28.3 GB** | **6.587** | [baa-ai/Qwen3.5-35B-A3B-MINT-MLX-28GB](https://huggingface.co/baa-ai/Qwen3.5-35B-A3B-MINT-MLX-28GB) |
+| Qwen3.5-35B-A3B (21 GB) | 21 GB | 6.713 | [baa-ai/Qwen3.5-35B-A3B-MINT-MLX-21GB](https://huggingface.co/baa-ai/Qwen3.5-35B-A3B-MINT-MLX-21GB) |
+| Qwen3.5-122B-A10B (3-bit) | 52 GB | 6.07 | [baa-ai/Qwen3.5-122B-A10B-MINT-3bit-MLX](https://huggingface.co/baa-ai/Qwen3.5-122B-A10B-MINT-3bit-MLX) |
+| Qwen3-30B-A3B | 17 GB | 8.97 | [baa-ai/Qwen3-30B-A3B-MINT-4bit-MLX](https://huggingface.co/baa-ai/Qwen3-30B-A3B-MINT-4bit-MLX) |
 
-## File Inventory
+### GGUF (Ollama / llama.cpp / LM Studio)
 
-| File | Purpose |
-|------|---------|
-| `compute_rd_curves.py` | Step 1: Rate-distortion analysis |
-| `allocator.py` | Step 2: MCKP budget-constrained solver |
-| `build_manifest.py` | Step 3: Allocation + model metadata -> manifest |
-| `bridge.py` | Manifest -> MLX quant_predicate function |
-| `convert.py` | Step 4: MLX model conversion |
-| `eval_perplexity.py` | Step 5: WikiText-2 perplexity evaluation |
-| `analyze_allocation.py` | Optional: analyze/compare allocations |
-| `run_experiment.py` | Optional: orchestrate convert + eval |
-| `MINT.tex` | Paper source |
+| Model | Sizes | Link |
+|-------|-------|------|
+| Qwen3.5-35B-A3B | 15–48 GB | [baa-ai/Qwen3.5-35B-A3B-MINT-*-GGUF](https://huggingface.co/baa-ai) |
+| Qwen3-30B-A3B | 17 GB | [baa-ai/Qwen3-30B-A3B-MINT-GGUF](https://huggingface.co/baa-ai/Qwen3-30B-A3B-MINT-GGUF) |
+
+## File Reference
+
+| File | Step | Description |
+|------|------|-------------|
+| `compute_rd_curves.py` | 1 | Rate-distortion analysis (13 configs per tensor) |
+| `allocator.py` | 2 | MCKP solver with `--speed-mode` and `--budget-gb` |
+| `build_manifest.py` | 3 | Allocation → manifest JSON |
+| `bridge.py` | 4a | Manifest → MLX `quant_predicate` |
+| `convert.py` | 4a | MLX model conversion |
+| `convert_gguf.py` | 4b | GGUF conversion via llama.cpp |
+| `eval_perplexity.py` | 5 | WikiText-2 perplexity evaluation |
+| `run_experiment.py` | 4a+5 | Orchestrator: convert + eval in one command |
+| `predict_quality.py` | 1→2 | Predict PPL before conversion (sweep + graph) |
+| `analyze_allocation.py` | — | Inspect/compare allocations |
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4) for Steps 4-5
 - Python 3.10+
-- ~2x model size in RAM for Step 1 (loading BF16 weights)
-
-### Dependencies
+- macOS with Apple Silicon for MLX inference (Steps 4a, 5)
+- Any platform for analysis (Steps 1-3) and GGUF conversion (Step 4b)
+- ~2× model size in RAM for Step 1
 
 ```
-torch          # Step 1 only (not needed at inference)
-safetensors    # Steps 1, 3
-mlx            # Steps 4, 5
-mlx-lm         # Steps 4, 5
-numpy          # Steps 1, 2
-scipy          # Optional (LP/ILP solvers)
-datasets       # Step 5 (WikiText-2)
+# Core (Steps 1-3)
+torch          # CPU tensor loading for RD analysis
+safetensors    # Read model shards
+numpy          # Numerical operations
+
+# MLX path (Steps 4a, 5)
+mlx            # Apple Silicon ML framework
+mlx-lm         # Model loading and conversion
+
+# GGUF path (Step 4b)
+# brew install llama.cpp
+
+# Evaluation
+datasets       # WikiText-2 download
+
+# Optional
+scipy          # LP/ILP solvers (greedy default has no dependency)
+matplotlib     # Quality curve graph (predict_quality.py)
 ```
 
 ## Citation
 
-If you use MINT in your research, please cite:
-
 ```bibtex
 @article{mint2026,
-  title={MINT: Compute-Optimal Data-Free Mixed-Precision Quantization for Large Language Models via Rate-Distortion Optimization},
+  title={MINT: Budget-Aware Data-Free Mixed-Precision Quantization
+         for Large Language Models via Rate-Distortion Optimization},
   author={baa.ai},
   year={2026},
   url={https://github.com/baa-ai/MINT}
@@ -252,4 +335,4 @@ If you use MINT in your research, please cite:
 
 ## License
 
-PolyForm Noncommercial 1.0.0 — see [LICENSE](LICENSE) for details.
+PolyForm Noncommercial 1.0.0 — see [LICENSE](LICENSE).

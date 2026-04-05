@@ -92,43 +92,6 @@ def build_module_lookup(manifest: Dict[str, Any]) -> Dict[str, Dict]:
     if moe_groups:
         logger.info(f"Mapped {len(moe_groups)} MoE expert groups to SwitchLinear modules")
 
-    # Handle packed MoE expert tensors (no individual expert index).
-    # Some models store experts as 3D tensors: experts.gate_up_proj [num_experts, d_in, d_out]
-    # MLX loads these as SwitchLinear: switch_mlp.gate_proj, switch_mlp.up_proj
-    packed_expert_pattern = re.compile(r"(.+)\.experts\.(gate_up_proj|down_proj)$")
-    packed_count = 0
-    packed_entries = {}
-    for key, cfg in list(lookup.items()):
-        m = packed_expert_pattern.match(key)
-        if m:
-            prefix, proj = m.groups()
-            if proj == "gate_up_proj":
-                packed_entries[f"{prefix}.switch_mlp.gate_proj"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.gate_proj.weight"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.up_proj"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.up_proj.weight"] = cfg
-                packed_count += 2
-            elif proj == "down_proj":
-                packed_entries[f"{prefix}.switch_mlp.down_proj"] = cfg
-                packed_entries[f"{prefix}.switch_mlp.down_proj.weight"] = cfg
-                packed_count += 1
-    if packed_entries:
-        lookup.update(packed_entries)
-        logger.info(f"Mapped {packed_count} packed expert tensors to SwitchLinear modules")
-
-    # Handle MLX sanitize remapping: some models remap safetensor keys during load.
-    # E.g., Qwen3.5 MoE: "model.language_model.X" -> "language_model.model.X"
-    # Add remapped variants so the predicate can match either naming convention.
-    remapped = {}
-    for key, cfg in lookup.items():
-        if key.startswith("model.language_model."):
-            alt = "language_model.model." + key[len("model.language_model."):]
-            if alt not in lookup:
-                remapped[alt] = cfg
-    if remapped:
-        lookup.update(remapped)
-        logger.info(f"Added {len(remapped)} MLX-sanitize remapped keys (model.language_model -> language_model.model)")
-
     return lookup
 
 
@@ -178,7 +141,7 @@ def create_knapsack_predicate(manifest: Dict[str, Any]):
         if any(p in name_lower for p in vision_patterns):
             return False
 
-        # Look up MINT decision — try multiple naming conventions
+        # Look up MINT decision — try multiple name variants
         cfg = lookup.get(name)
         if cfg is None:
             cfg = lookup.get(name + ".weight")
@@ -187,18 +150,34 @@ def create_knapsack_predicate(manifest: Dict[str, Any]):
         if cfg is None:
             cfg = lookup.get("language_model." + name + ".weight")
         if cfg is None:
+            # VLM/multimodal: MLX uses "language_model.model.layers.X"
+            # but safetensors use "model.language_model.layers.X"
             cfg = lookup.get("model." + name)
         if cfg is None:
             cfg = lookup.get("model." + name + ".weight")
-        # Reverse MLX sanitize: language_model.model.X -> model.language_model.X
-        if cfg is None and name.startswith("language_model.model."):
-            orig = "model.language_model." + name[len("language_model.model."):]
-            cfg = lookup.get(orig)
-            if cfg is None:
-                cfg = lookup.get(orig + ".weight")
+        if cfg is None:
+            # Swap prefix: language_model.model.X -> model.language_model.X
+            rewritten = re.sub(r"^language_model\.model\.", "model.language_model.", name)
+            if rewritten != name:
+                cfg = lookup.get(rewritten)
+                if cfg is None:
+                    cfg = lookup.get(rewritten + ".weight")
 
         if cfg is None:
-            logger.warning(f"No manifest entry for '{name}', using default 4-bit")
+            # SwitchLinear: MLX uses "switch_mlp.{gate,up,down}_proj"
+            # but manifest may use "experts.{gate_up,down}_proj"
+            candidate = name
+            # Apply prefix swap first if needed
+            candidate = re.sub(r"^language_model\.model\.", "model.language_model.", candidate)
+            # Map switch_mlp projections to expert tensor names
+            sw = re.sub(r"\.switch_mlp\.(gate_proj|up_proj)", ".experts.gate_up_proj", candidate)
+            sw = re.sub(r"\.switch_mlp\.down_proj", ".experts.down_proj", sw)
+            if sw != candidate:
+                cfg = lookup.get(sw)
+                if cfg is None:
+                    cfg = lookup.get(sw + ".weight")
+
+        if cfg is None:
             return True  # default 4-bit
 
         bits = cfg["bits"]
@@ -212,11 +191,8 @@ def create_knapsack_predicate(manifest: Dict[str, Any]):
                 return False
             return {"bits": 8, "group_size": group_size}
 
-        if bits == 2:
-            return {"bits": 2, "group_size": group_size}
-
-        if bits == 3:
-            return {"bits": 3, "group_size": group_size}
+        if bits in (2, 3, 5, 6):
+            return {"bits": bits, "group_size": group_size}
 
         # 4-bit with explicit per-tensor group_size
         return {"bits": 4, "group_size": group_size}

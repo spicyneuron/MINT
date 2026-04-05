@@ -28,10 +28,15 @@ logger = logging.getLogger("mint.rd_curves")
 CONFIGS = [
     (2, 32),
     (2, 64),
+    (3, 32),
     (3, 64),
     (4, 32),
     (4, 64),
     (4, 128),
+    (5, 32),
+    (5, 64),
+    (6, 32),
+    (6, 64),
     (8, 64),
     (8, 128),
 ]
@@ -42,13 +47,17 @@ def compute_nrmse(tensor: torch.Tensor, bits: int, group_size: int) -> float:
     if tensor.dim() < 2:
         return 0.0
 
-    # Handle 3D+ tensors: MoE expert tensors [num_experts, d_in, d_out] or vision patches
-    if tensor.dim() > 2:
-        t = tensor.reshape(-1, tensor.shape[-1]).float()
-        rows, cols = t.shape
-    else:
-        t = tensor.float()
-        rows, cols = t.shape
+    # Handle >3D tensors (e.g., vision patch_embed [C, 3, 2, H, W]) by flattening to 2D
+    if tensor.dim() > 3:
+        tensor = tensor.reshape(tensor.shape[0], -1)
+
+    # Handle 3D MoE expert tensors [num_experts, d_in, d_out]
+    if tensor.dim() == 3:
+        nrmses = [compute_nrmse(tensor[i], bits, group_size) for i in range(tensor.shape[0])]
+        return max(nrmses)  # worst-case across experts
+
+    t = tensor.float()
+    rows, cols = t.shape
 
     # Pad columns to group_size multiple
     if cols % group_size != 0:
@@ -78,6 +87,10 @@ def compute_sqnr(tensor: torch.Tensor, bits: int, group_size: int) -> float:
     """Compute SQNR in dB for a given (bits, group_size) config."""
     if tensor.dim() < 2:
         return float("inf")
+
+    # Handle >3D tensors by flattening to 2D
+    if tensor.dim() > 3:
+        tensor = tensor.reshape(tensor.shape[0], -1)
 
     # Handle 3D MoE expert tensors [num_experts, d_in, d_out]
     if tensor.dim() == 3:
